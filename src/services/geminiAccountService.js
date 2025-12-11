@@ -17,9 +17,10 @@ const {
 const tokenRefreshService = require('./tokenRefreshService')
 const LRUCache = require('../utils/lruCache')
 
-// Gemini CLI OAuth 配置 - 这些是公开的 Gemini CLI 凭据
-const OAUTH_CLIENT_ID = '681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com'
-const OAUTH_CLIENT_SECRET = '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'
+// Gemini CLI OAuth 配置 - 从环境变量读取
+// 默认值是公开的 Gemini CLI 凭据 (可在 .env 文件中覆盖)
+const OAUTH_CLIENT_ID = process.env.GEMINI_OAUTH_CLIENT_ID || '681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com'
+const OAUTH_CLIENT_SECRET = process.env.GEMINI_OAUTH_CLIENT_SECRET || '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'
 const OAUTH_SCOPES = ['https://www.googleapis.com/auth/cloud-platform']
 
 // 🌐 TCP Keep-Alive Agent 配置

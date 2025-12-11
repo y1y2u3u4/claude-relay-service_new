@@ -38,6 +38,7 @@ const {
   requestSizeLimit
 } = require('./middleware/auth')
 const { browserFallbackMiddleware } = require('./middleware/browserFallback')
+const { ipWhitelistMiddleware } = require('./middleware/ipWhitelist')
 
 class Application {
   constructor() {
@@ -89,6 +90,9 @@ class Application {
       logger.info('📊 Initializing cost rank service...')
       const costRankService = require('./services/costRankService')
       await costRankService.initialize()
+
+      // 🔒 IP白名单检查 - 必须在所有其他中间件之前
+      this.app.use(ipWhitelistMiddleware)
 
       // 超早期拦截 /admin-next/ 请求 - 在所有中间件之前
       this.app.use((req, res, next) => {
@@ -284,6 +288,76 @@ class Application {
       // 🏠 根路径重定向到新版管理界面
       this.app.get('/', (req, res) => {
         res.redirect('/admin-next/api-stats')
+      })
+
+      // 🔍 IP检测调试端点（增强版）
+      this.app.get('/debug/my-ip', async (req, res) => {
+        try {
+          const ipHelper = require('./utils/ipHelper')
+
+          // 获取原始IP
+          const originalIP =
+            req.ip || req.connection?.remoteAddress || req.socket?.remoteAddress || 'unknown'
+
+          // 使用 ipHelper 解析IP
+          const resolvedIP = await ipHelper.resolveClientIP(req)
+
+          // 检测是否为内网IP
+          const isPrivate = ipHelper.isPrivateIP(originalIP)
+
+          // 获取服务器公网IP（仅在需要时）
+          let serverPublicIP = null
+          if (isPrivate) {
+            serverPublicIP = await ipHelper.getServerPublicIP()
+          }
+
+          // 白名单检查
+          const whitelist = config.security?.ipWhitelist?.allowedIps || []
+          const enabled = config.security?.ipWhitelist?.enabled || false
+
+          const isWhitelisted = enabled
+            ? whitelist.some((allowedIp) => {
+                if (resolvedIP === allowedIp) return true
+                const ipv4Match = resolvedIP.match(/::ffff:(.+)/)
+                if (ipv4Match && ipv4Match[1] === allowedIp) return true
+                return false
+              })
+            : true // 如果未启用白名单，认为所有IP都通过
+
+          res.json({
+            // 最终使用的IP
+            resolvedIP: resolvedIP,
+            // 是否通过白名单
+            isWhitelisted: isWhitelisted,
+            // IP解析详情
+            ipResolution: {
+              originalIP: originalIP,
+              isPrivateIP: isPrivate,
+              serverPublicIP: serverPublicIP,
+              strategy: config.ipResolve?.strategy || 'auto'
+            },
+            // 详细信息
+            details: {
+              'x-forwarded-for': req.headers['x-forwarded-for'] || null,
+              'x-real-ip': req.headers['x-real-ip'] || null,
+              'cf-connecting-ip': req.headers['cf-connecting-ip'] || null,
+              'req.ip': req.ip || null,
+              'req.connection.remoteAddress': req.connection?.remoteAddress || null,
+              'trust proxy': this.app.get('trust proxy')
+            },
+            // 白名单配置
+            whitelist: {
+              enabled: enabled,
+              allowedIps: whitelist
+            }
+          })
+        } catch (error) {
+          logger.error(`❌ Error in /debug/my-ip: ${error.message}`)
+          res.status(500).json({
+            error: 'Internal Server Error',
+            message: error.message
+          })
+        }
       })
 
       // 🏥 增强的健康检查端点

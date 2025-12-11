@@ -367,29 +367,50 @@ class ClaudeRelayService {
           // 记录401错误
           await this.recordUnauthorizedError(accountId)
 
-          // 检查是否需要标记为异常（遇到1次401就停止调度）
+          // 检查是否需要标记为异常（连续5次401才停止调度）
           const errorCount = await this.getUnauthorizedErrorCount(accountId)
           logger.info(
             `🔐 Account ${accountId} has ${errorCount} consecutive 401 errors in the last 5 minutes`
           )
 
-          if (errorCount >= 1) {
+          if (errorCount >= 5) {
             logger.error(
-              `❌ Account ${accountId} encountered 401 error (${errorCount} errors), marking as unauthorized`
+              `❌ Account ${accountId} encountered 401 error ${errorCount} times (threshold: 5), marking as unauthorized`
             )
             await unifiedClaudeScheduler.markAccountUnauthorized(
               accountId,
               accountType,
               sessionHash
             )
+          } else {
+            logger.warn(
+              `⚠️  Account ${accountId} has ${errorCount}/5 consecutive 401 errors, not marking as unauthorized yet`
+            )
           }
         }
         // 检查是否为403状态码（禁止访问）
         else if (response.statusCode === 403) {
-          logger.error(
-            `🚫 Forbidden error (403) detected for account ${accountId}, marking as blocked`
+          logger.warn(`🚫 Forbidden error (403) detected for account ${accountId}`)
+
+          // 记录403错误
+          await this.recordBlockedError(accountId)
+
+          // 检查是否需要标记为异常（连续5次403才停止调度）
+          const errorCount = await this.getBlockedErrorCount(accountId)
+          logger.info(
+            `🚫 Account ${accountId} has ${errorCount} consecutive 403 errors in the last 5 minutes`
           )
-          await unifiedClaudeScheduler.markAccountBlocked(accountId, accountType, sessionHash)
+
+          if (errorCount >= 5) {
+            logger.error(
+              `❌ Account ${accountId} encountered 403 error ${errorCount} times (threshold: 5), marking as blocked`
+            )
+            await unifiedClaudeScheduler.markAccountBlocked(accountId, accountType, sessionHash)
+          } else {
+            logger.warn(
+              `⚠️  Account ${accountId} has ${errorCount}/5 consecutive 403 errors, not marking as blocked yet`
+            )
+          }
         }
         // 检查是否返回组织被禁用错误（400状态码）
         else if (organizationDisabledError) {
@@ -405,12 +426,27 @@ class ClaudeRelayService {
           // 检查是否启用了529错误处理
           if (config.claude.overloadHandling.enabled > 0) {
             try {
-              await claudeAccountService.markAccountOverloaded(accountId)
+              // 记录529错误
+              await this.recordOverloadError(accountId)
+
+              // 检查错误计数（连续3次529才标记为过载）
+              const errorCount = await this.getOverloadErrorCount(accountId)
               logger.info(
-                `🚫 Account ${accountId} marked as overloaded for ${config.claude.overloadHandling.enabled} minutes`
+                `🚫 Account ${accountId} has ${errorCount} consecutive 529 errors in the last 5 minutes`
               )
+
+              if (errorCount >= 3) {
+                await claudeAccountService.markAccountOverloaded(accountId)
+                logger.error(
+                  `❌ Account ${accountId} encountered 529 error ${errorCount} times (threshold: 3), marking as overloaded for ${config.claude.overloadHandling.enabled} minutes`
+                )
+              } else {
+                logger.warn(
+                  `⚠️  Account ${accountId} has ${errorCount}/3 consecutive 529 errors, not marking as overloaded yet`
+                )
+              }
             } catch (overloadError) {
-              logger.error(`❌ Failed to mark account as overloaded: ${accountId}`, overloadError)
+              logger.error(`❌ Failed to handle 529 error for account ${accountId}:`, overloadError)
             }
           } else {
             logger.info(`🚫 529 error handling is disabled, skipping account overload marking`)
@@ -535,8 +571,10 @@ class ClaudeRelayService {
           await claudeAccountService.updateSessionWindowStatus(accountId, sessionWindowStatus)
         }
 
-        // 请求成功，清除401和500错误计数
+        // 请求成功，清除401、403、529和500错误计数
         await this.clearUnauthorizedErrors(accountId)
+        await this.clearBlockedErrors(accountId)
+        await this.clearOverloadErrors(accountId)
         await claudeAccountService.clearInternalErrors(accountId)
         // 如果请求成功，检查并移除限流状态
         const isRateLimited = await unifiedClaudeScheduler.isAccountRateLimited(
@@ -2230,6 +2268,86 @@ class ClaudeRelayService {
       logger.info(`✅ Cleared 401 error count for account ${accountId}`)
     } catch (error) {
       logger.error(`❌ Failed to clear 401 errors for account ${accountId}:`, error)
+    }
+  }
+
+  // 📝 记录403错误
+  async recordBlockedError(accountId) {
+    try {
+      const key = `claude_account:${accountId}:403_errors`
+
+      // 增加错误计数，设置5分钟过期时间
+      await redis.client.incr(key)
+      await redis.client.expire(key, 300) // 5分钟
+
+      logger.info(`📝 Recorded 403 error for account ${accountId}`)
+    } catch (error) {
+      logger.error(`❌ Failed to record 403 error for account ${accountId}:`, error)
+    }
+  }
+
+  // 🔍 获取403错误计数
+  async getBlockedErrorCount(accountId) {
+    try {
+      const key = `claude_account:${accountId}:403_errors`
+
+      const count = await redis.client.get(key)
+      return parseInt(count) || 0
+    } catch (error) {
+      logger.error(`❌ Failed to get 403 error count for account ${accountId}:`, error)
+      return 0
+    }
+  }
+
+  // 🧹 清除403错误计数
+  async clearBlockedErrors(accountId) {
+    try {
+      const key = `claude_account:${accountId}:403_errors`
+
+      await redis.client.del(key)
+      logger.info(`✅ Cleared 403 error count for account ${accountId}`)
+    } catch (error) {
+      logger.error(`❌ Failed to clear 403 errors for account ${accountId}:`, error)
+    }
+  }
+
+  // 📝 记录529过载错误
+  async recordOverloadError(accountId) {
+    try {
+      const key = `claude_account:${accountId}:529_errors`
+
+      // 增加错误计数，设置5分钟过期时间
+      await redis.client.incr(key)
+      await redis.client.expire(key, 300) // 5分钟
+
+      logger.info(`📝 Recorded 529 error for account ${accountId}`)
+    } catch (error) {
+      logger.error(`❌ Failed to record 529 error for account ${accountId}:`, error)
+    }
+  }
+
+  // 🔍 获取529过载错误计数
+  async getOverloadErrorCount(accountId) {
+    try {
+      const key = `claude_account:${accountId}:529_errors`
+
+      const count = await redis.client.get(key)
+      return parseInt(count) || 0
+    } catch (error) {
+      logger.error(`❌ Failed to get 529 error count for account ${accountId}:`, error)
+      return 0
+    }
+  }
+
+  // 🧹 清除529过载错误计数
+  async clearOverloadErrors(accountId) {
+    try {
+      const key = `claude_account:${accountId}:529_errors`
+
+      await redis.client.del(key)
+      logger.info(`✅ Cleared 529 error count for account ${accountId}`)
+    } catch (error) {
+      logger.error(`❌ Failed to clear 529 errors for account ${accountId}:`, error)
     }
   }
 

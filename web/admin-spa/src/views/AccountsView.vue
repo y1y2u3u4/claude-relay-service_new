@@ -721,13 +721,53 @@
                         <i class="fas fa-question-circle ml-1 cursor-help text-gray-500" />
                       </el-tooltip>
                     </span>
-                    <span
-                      v-if="account.status === 'blocked' && account.errorMessage"
-                      class="mt-1 max-w-xs truncate text-xs text-gray-500 dark:text-gray-400"
-                      :title="account.errorMessage"
+                    <!-- 详细错误信息 -->
+                    <div
+                      v-if="
+                        account.status === 'unauthorized' ||
+                        account.status === 'blocked' ||
+                        account.status === 'temp_error'
+                      "
+                      class="mt-1 space-y-0.5"
                     >
-                      {{ account.errorMessage }}
-                    </span>
+                      <span
+                        v-if="account.errorMessage"
+                        class="block max-w-xs truncate text-xs text-gray-600 dark:text-gray-400"
+                        :title="account.errorMessage"
+                      >
+                        {{ account.errorMessage }}
+                      </span>
+                      <span
+                        v-if="account.unauthorizedAt"
+                        class="block text-xs text-gray-500 dark:text-gray-500"
+                      >
+                        <i class="fas fa-clock mr-1" />
+                        失败时间: {{ formatErrorTime(account.unauthorizedAt) }}
+                      </span>
+                      <span
+                        v-else-if="account.blockedAt"
+                        class="block text-xs text-gray-500 dark:text-gray-500"
+                      >
+                        <i class="fas fa-clock mr-1" />
+                        封锁时间: {{ formatErrorTime(account.blockedAt) }}
+                      </span>
+                      <span
+                        v-else-if="account.tempErrorAt"
+                        class="block text-xs text-gray-500 dark:text-gray-500"
+                      >
+                        <i class="fas fa-clock mr-1" />
+                        错误时间: {{ formatErrorTime(account.tempErrorAt) }}
+                      </span>
+                      <span
+                        v-if="
+                          account.status === 'unauthorized' || account.status === 'blocked'
+                        "
+                        class="block text-xs text-blue-600 dark:text-blue-400"
+                      >
+                        <i class="fas fa-info-circle mr-1" />
+                        10分钟后自动尝试恢复
+                      </span>
+                    </div>
                     <span
                       v-if="account.accountType === 'dedicated'"
                       class="text-xs text-gray-500 dark:text-gray-400"
@@ -3259,6 +3299,40 @@ const formatRateLimitTime = (minutes) => {
   } else {
     // 不到1小时，只显示分钟
     return `${mins}分钟`
+  }
+}
+
+const formatErrorTime = (isoTimestamp) => {
+  if (!isoTimestamp) return ''
+
+  try {
+    const errorTime = new Date(isoTimestamp)
+    const now = new Date()
+    const diffMs = now - errorTime
+    const diffMinutes = Math.floor(diffMs / (1000 * 60))
+    const diffHours = Math.floor(diffMs / (1000 * 60 * 60))
+    const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24))
+
+    // 根据时间差返回友好的显示
+    if (diffMinutes < 1) {
+      return '刚刚'
+    } else if (diffMinutes < 60) {
+      return `${diffMinutes}分钟前`
+    } else if (diffHours < 24) {
+      return `${diffHours}小时前`
+    } else if (diffDays < 7) {
+      return `${diffDays}天前`
+    } else {
+      // 超过7天，显示具体日期
+      return errorTime.toLocaleString('zh-CN', {
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit'
+      })
+    }
+  } catch (error) {
+    return ''
   }
 }
 
