@@ -296,6 +296,21 @@ async function handleMessagesRequest(req, res) {
           )
           return
         }
+        // 处理共享账号池所有账号都被限流的情况
+        if (error.code === 'ALL_ACCOUNTS_RATE_LIMITED') {
+          const limitMessage = claudeRelayService._buildStandardRateLimitMessage(
+            error.rateLimitEndAt
+          )
+          res.status(403)
+          res.setHeader('Content-Type', 'application/json')
+          res.end(
+            JSON.stringify({
+              error: 'upstream_rate_limited',
+              message: limitMessage
+            })
+          )
+          return
+        }
         throw error
       }
 
@@ -738,6 +753,16 @@ async function handleMessagesRequest(req, res) {
           })
         }
         if (error.code === 'CLAUDE_DEDICATED_RATE_LIMITED') {
+          const limitMessage = claudeRelayService._buildStandardRateLimitMessage(
+            error.rateLimitEndAt
+          )
+          return res.status(403).json({
+            error: 'upstream_rate_limited',
+            message: limitMessage
+          })
+        }
+        // 处理共享账号池所有账号都被限流的情况
+        if (error.code === 'ALL_ACCOUNTS_RATE_LIMITED') {
           const limitMessage = claudeRelayService._buildStandardRateLimitMessage(
             error.rateLimitEndAt
           )
@@ -1460,6 +1485,13 @@ router.post('/v1/messages/count_tokens', authenticateApiKey, async (req, res) =>
       return
     }
   }
+})
+
+// 📊 Claude Code 遥测端点 - 静默处理，避免 404 噪音
+router.post('/api/event_logging/batch', (req, res) => {
+  // Claude Code 客户端会发送遥测数据，我们不需要处理
+  // 返回 200 OK 让客户端满意即可
+  res.status(200).json({ success: true })
 })
 
 module.exports = router

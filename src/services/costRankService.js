@@ -269,6 +269,13 @@ class CostRankService {
     }
 
     try {
+      // 跳过隐身 Key
+      const keyData = await redis.getApiKey(keyId)
+      if (keyData && keyData.isHidden === 'true') {
+        logger.debug(`Skipping hidden key ${keyId} from cost rank indexes`)
+        return
+      }
+
       const pipeline = client.pipeline()
 
       // 将新 Key 添加到所有索引，初始分数为 0
@@ -470,10 +477,10 @@ class CostRankService {
       return []
     }
 
-    // 批量获取 API Key 数据，过滤已删除的
+    // 批量获取 API Key 数据，过滤已删除的和隐身的
     const allKeys = await redis.batchGetApiKeys(allKeyIds)
 
-    return allKeys.filter((k) => !k.isDeleted).map((k) => k.id)
+    return allKeys.filter((k) => !k.isDeleted && k.isHidden !== 'true').map((k) => k.id)
   }
 
   /**

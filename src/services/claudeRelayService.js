@@ -2,6 +2,7 @@ const https = require('https')
 const zlib = require('zlib')
 const fs = require('fs')
 const path = require('path')
+const crypto = require('crypto')
 const ProxyHelper = require('../utils/proxyHelper')
 const { filterForClaude } = require('../utils/headerFilter')
 const claudeAccountService = require('./claudeAccountService')
@@ -16,6 +17,9 @@ const { formatDateWithTimezone } = require('../utils/dateHelper')
 const requestIdentityService = require('./requestIdentityService')
 const { createClaudeTestPayload } = require('../utils/testPayloadHelper')
 const userMessageQueueService = require('./userMessageQueueService')
+const error403CircuitBreakerService = require('./error403CircuitBreakerService')
+const accountRateLimitService = require('./accountRateLimitService')
+const sameSecondRequestGuard = require('../utils/sameSecondRequestGuard')
 
 class ClaudeRelayService {
   constructor() {
@@ -153,6 +157,10 @@ class ClaudeRelayService {
     let queueRequestId = null
     let queueLockRenewalStopper = null
     let selectedAccountId = null
+    let concurrencyAcquired = false
+    let concurrencyRequestId = null
+    let rateLimitAcquired = false
+    let rateLimitRequestId = null
 
     try {
       // 调试日志：查看API Key数据
@@ -273,6 +281,106 @@ class ClaudeRelayService {
         account = await claudeAccountService.getAccount(accountId)
       }
 
+      // 🔒 并发控制：检查是否需要计入并发
+      // 只有在以下情况才计入并发：
+      // 1. 如果 excludeToolsFromConcurrency 为 false（限制所有请求）
+      // 2. 如果 excludeToolsFromConcurrency 为 true，但这是用户消息（不是工具调用）
+      const isUserMessage = userMessageQueueService.isUserMessageRequest(requestBody)
+      const shouldTrackConcurrency = !config.claude.excludeToolsFromConcurrency || isUserMessage
+
+      if (shouldTrackConcurrency) {
+        // 获取账户的并发限制配置
+        const maxConcurrent =
+          Number(account.maxConcurrentTasks) || config.claude.defaultMaxConcurrentTasks || 0
+
+        if (maxConcurrent > 0) {
+          // 生成唯一的请求ID用于并发追踪
+          concurrencyRequestId = crypto.randomUUID()
+
+          // 原子性抢占并发槽位
+          const newConcurrency = Number(
+            await redis.incrConsoleAccountConcurrency(accountId, concurrencyRequestId, 600)
+          )
+          concurrencyAcquired = true
+
+          // 检查是否超过限制
+          if (newConcurrency > maxConcurrent) {
+            // 超限，立即回滚
+            await redis.decrConsoleAccountConcurrency(accountId, concurrencyRequestId)
+            concurrencyAcquired = false
+
+            logger.warn(
+              `⚠️ Claude official account ${account.name || accountId} concurrency limit exceeded: ${newConcurrency}/${maxConcurrent} (request type: ${isUserMessage ? 'user message' : 'tool result'}, rolled back)`
+            )
+
+            // 返回并发限制错误
+            return {
+              statusCode: 429,
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                type: 'error',
+                error: {
+                  type: 'concurrency_limit_exceeded',
+                  message: `Account concurrency limit exceeded (${newConcurrency}/${maxConcurrent}), please retry later`
+                }
+              }),
+              accountId
+            }
+          }
+
+          logger.debug(
+            `🔒 Acquired concurrency slot for account ${account.name || accountId}: ${newConcurrency}/${maxConcurrent} (request: ${concurrencyRequestId}, type: ${isUserMessage ? 'user message' : 'tool result'})`
+          )
+        }
+      } else {
+        logger.debug(
+          `⚡ Skipping concurrency check for tool result (excludeToolsFromConcurrency=true)`
+        )
+      }
+
+      // 📊 账号级速率限制（仅对用户消息生效）
+      if (isUserMessage) {
+        const rateLimitResult = await accountRateLimitService.acquireRateLimit(accountId)
+
+        if (!rateLimitResult.acquired && !rateLimitResult.skipped) {
+          // 速率限制超限，释放已获取的并发槽位
+          if (concurrencyAcquired && concurrencyRequestId) {
+            await redis.decrConsoleAccountConcurrency(accountId, concurrencyRequestId)
+            concurrencyAcquired = false
+            logger.debug(
+              `🔓 Released concurrency slot due to rate limit for account ${accountId}, request: ${concurrencyRequestId}`
+            )
+          }
+
+          // 返回429错误
+          logger.warn(
+            `⏳ Account rate limit exceeded for account ${accountId}: ${rateLimitResult.error}`,
+            { requestId: rateLimitResult.requestId }
+          )
+
+          return {
+            statusCode: 429,
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              error: {
+                type: 'rate_limit_exceeded',
+                message: 'Account rate limit exceeded, please retry later'
+              }
+            }),
+            accountId
+          }
+        }
+
+        if (rateLimitResult.acquired) {
+          rateLimitAcquired = true
+          rateLimitRequestId = rateLimitResult.requestId
+          logger.debug(`📊 Acquired rate limit slot for account ${accountId}`, {
+            requestId: rateLimitRequestId,
+            waitedMs: rateLimitResult.waitedMs || 0
+          })
+        }
+      }
+
       const isDedicatedOfficialAccount =
         accountType === 'claude-official' &&
         apiKeyData.claudeAccountId &&
@@ -304,6 +412,46 @@ class ClaudeRelayService {
 
       // 获取有效的访问token
       const accessToken = await claudeAccountService.getValidAccessToken(accountId)
+
+      // 🛡️ 同秒请求防护：确保同一账户不会在同一秒内发送多次请求
+      if (config.claude.sameSecondRequestGuard?.enabled !== false) {
+        const maxWait = config.claude.sameSecondRequestGuard?.maxWaitMs || 1000
+        const guardResult = await sameSecondRequestGuard.checkAndWait(accountId, accountType, maxWait)
+        if (!guardResult.allowed) {
+          logger.warn(
+            `🚫 Same-second request rejected for account ${accountId} (${accountType}), wait time exceeded threshold`
+          )
+
+          // 释放已获取的资源
+          if (rateLimitAcquired && rateLimitRequestId) {
+            await accountRateLimitService.releaseRateLimit(accountId, rateLimitRequestId)
+            rateLimitAcquired = false
+          }
+          if (concurrencyAcquired && concurrencyRequestId) {
+            await redis.decrConsoleAccountConcurrency(accountId, concurrencyRequestId)
+            concurrencyAcquired = false
+          }
+
+          return {
+            statusCode: 429,
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              type: 'error',
+              error: {
+                type: 'same_second_request_blocked',
+                message: 'Too many requests in the same second, please retry'
+              }
+            }),
+            accountId
+          }
+        }
+
+        if (guardResult.waitedMs > 0) {
+          logger.info(
+            `⏱️ Same-second guard waited ${guardResult.waitedMs}ms for account ${accountId} (${accountType})`
+          )
+        }
+      }
 
       const processedBody = this._processRequestBody(requestBody, account)
 
@@ -388,74 +536,52 @@ class ClaudeRelayService {
             )
           }
         }
-        // 检查是否为403状态码（禁止访问）
+        // 检查是否为403状态码（禁止访问 - 触发熔断机制）
         else if (response.statusCode === 403) {
-          logger.warn(`🚫 Forbidden error (403) detected for account ${accountId}`)
-
-          // 记录403错误
-          await this.recordBlockedError(accountId)
-
-          // 检查是否需要标记为异常（连续5次403才停止调度）
-          const errorCount = await this.getBlockedErrorCount(accountId)
-          logger.info(
-            `🚫 Account ${accountId} has ${errorCount} consecutive 403 errors in the last 5 minutes`
+          logger.warn(
+            `🚫 Forbidden error (403) detected for account ${accountId} - triggering circuit breaker`
           )
 
-          if (errorCount >= 5) {
+          // 记录403错误并检查是否触发熔断
+          const breakerResult = await error403CircuitBreakerService.record403Error(accountId)
+
+          if (breakerResult.triggered) {
+            // 熔断器触发，标记账户为blocked
             logger.error(
-              `❌ Account ${accountId} encountered 403 error ${errorCount} times (threshold: 5), marking as blocked`
+              `🔥 Circuit breaker TRIGGERED for account ${accountId}, marking as blocked`,
+              {
+                errorCount: breakerResult.errorCount,
+                threshold: breakerResult.threshold
+              }
             )
             await unifiedClaudeScheduler.markAccountBlocked(accountId, accountType, sessionHash)
           } else {
             logger.warn(
-              `⚠️  Account ${accountId} has ${errorCount}/5 consecutive 403 errors, not marking as blocked yet`
+              `⚠️  Account ${accountId} has ${breakerResult.errorCount}/${breakerResult.threshold} 403 errors`,
+              {
+                errorCount: breakerResult.errorCount,
+                threshold: breakerResult.threshold
+              }
             )
           }
         }
-        // 检查是否返回组织被禁用错误（400状态码）
+        // 检查是否返回组织被禁用错误（400状态码）- 只记录不标记
         else if (organizationDisabledError) {
           logger.error(
-            `🚫 Organization disabled error (400) detected for account ${accountId}, marking as blocked`
+            `🚫 Organization disabled error (400) detected for account ${accountId} - logging only, not marking account`
           )
-          await unifiedClaudeScheduler.markAccountBlocked(accountId, accountType, sessionHash)
         }
-        // 检查是否为529状态码（服务过载）
+        // 检查是否为529状态码（服务过载）- 只记录不标记
         else if (response.statusCode === 529) {
-          logger.warn(`🚫 Overload error (529) detected for account ${accountId}`)
-
-          // 检查是否启用了529错误处理
-          if (config.claude.overloadHandling.enabled > 0) {
-            try {
-              // 记录529错误
-              await this.recordOverloadError(accountId)
-
-              // 检查错误计数（连续3次529才标记为过载）
-              const errorCount = await this.getOverloadErrorCount(accountId)
-              logger.info(
-                `🚫 Account ${accountId} has ${errorCount} consecutive 529 errors in the last 5 minutes`
-              )
-
-              if (errorCount >= 3) {
-                await claudeAccountService.markAccountOverloaded(accountId)
-                logger.error(
-                  `❌ Account ${accountId} encountered 529 error ${errorCount} times (threshold: 3), marking as overloaded for ${config.claude.overloadHandling.enabled} minutes`
-                )
-              } else {
-                logger.warn(
-                  `⚠️  Account ${accountId} has ${errorCount}/3 consecutive 529 errors, not marking as overloaded yet`
-                )
-              }
-            } catch (overloadError) {
-              logger.error(`❌ Failed to handle 529 error for account ${accountId}:`, overloadError)
-            }
-          } else {
-            logger.info(`🚫 529 error handling is disabled, skipping account overload marking`)
-          }
+          logger.warn(
+            `🚫 Overload error (529) detected for account ${accountId} - temporary, not marking account`
+          )
         }
-        // 检查是否为5xx状态码
+        // 检查是否为5xx状态码 - 只记录不标记
         else if (response.statusCode >= 500 && response.statusCode < 600) {
-          logger.warn(`🔥 Server error (${response.statusCode}) detected for account ${accountId}`)
-          await this._handleServerError(accountId, response.statusCode, sessionHash)
+          logger.warn(
+            `🔥 Server error (${response.statusCode}) detected for account ${accountId} - temporary, not marking account`
+          )
         }
         // 检查是否为429状态码
         else if (response.statusCode === 429) {
@@ -646,6 +772,36 @@ class ClaudeRelayService {
       )
       throw error
     } finally {
+      // 🔓 并发控制：释放并发槽位
+      if (concurrencyAcquired && concurrencyRequestId && selectedAccountId) {
+        try {
+          await redis.decrConsoleAccountConcurrency(selectedAccountId, concurrencyRequestId)
+          logger.debug(
+            `🔓 Released concurrency slot for account ${selectedAccountId}, request: ${concurrencyRequestId}`
+          )
+        } catch (releaseError) {
+          logger.error(
+            `❌ Failed to release concurrency slot for account ${selectedAccountId}:`,
+            releaseError.message
+          )
+        }
+      }
+
+      // 📊 释放速率限制槽位（客户端断开或错误时）
+      if (rateLimitAcquired && rateLimitRequestId && selectedAccountId) {
+        try {
+          await accountRateLimitService.releaseRateLimit(selectedAccountId, rateLimitRequestId)
+          logger.debug(
+            `📊 Released rate limit slot for account ${selectedAccountId}, request: ${rateLimitRequestId}`
+          )
+        } catch (releaseError) {
+          logger.error(
+            `❌ Failed to release rate limit slot for account ${selectedAccountId}:`,
+            releaseError.message
+          )
+        }
+      }
+
       // 📬 释放用户消息队列锁
       if (queueLockAcquired && queueRequestId && selectedAccountId) {
         try {
@@ -1285,6 +1441,11 @@ class ClaudeRelayService {
     let queueRequestId = null
     let queueLockRenewalStopper = null
     let selectedAccountId = null
+    let concurrencyAcquired = false
+    let concurrencyRequestId = null
+    let leaseRefreshInterval = null
+    let rateLimitAcquired = false
+    let rateLimitRequestId = null
 
     try {
       // 调试日志：查看API Key数据（流式请求）
@@ -1410,6 +1571,140 @@ class ClaudeRelayService {
         account = await claudeAccountService.getAccount(accountId)
       }
 
+      // 🔒 并发控制：检查是否需要计入并发
+      // 只有在以下情况才计入并发：
+      // 1. 如果 excludeToolsFromConcurrency 为 false（限制所有请求）
+      // 2. 如果 excludeToolsFromConcurrency 为 true，但这是用户消息（不是工具调用）
+      const isUserMessage = userMessageQueueService.isUserMessageRequest(requestBody)
+      const shouldTrackConcurrency = !config.claude.excludeToolsFromConcurrency || isUserMessage
+
+      if (shouldTrackConcurrency) {
+        // 获取账户的并发限制配置
+        const maxConcurrent =
+          Number(account.maxConcurrentTasks) || config.claude.defaultMaxConcurrentTasks || 0
+
+        if (maxConcurrent > 0) {
+          // 生成唯一的请求ID用于并发追踪
+          concurrencyRequestId = crypto.randomUUID()
+
+          // 原子性抢占并发槽位
+          const newConcurrency = Number(
+            await redis.incrConsoleAccountConcurrency(accountId, concurrencyRequestId, 600)
+          )
+          concurrencyAcquired = true
+
+          // 检查是否超过限制
+          if (newConcurrency > maxConcurrent) {
+            // 超限，立即回滚
+            await redis.decrConsoleAccountConcurrency(accountId, concurrencyRequestId)
+            concurrencyAcquired = false
+
+            logger.warn(
+              `⚠️ Claude official account ${account.name || accountId} concurrency limit exceeded (stream): ${newConcurrency}/${maxConcurrent} (request type: ${isUserMessage ? 'user message' : 'tool result'}, rolled back)`
+            )
+
+            // 返回并发限制错误
+            if (!responseStream.headersSent) {
+              responseStream.status(429)
+              responseStream.setHeader('Content-Type', 'application/json')
+            }
+            responseStream.write(
+              JSON.stringify({
+                type: 'error',
+                error: {
+                  type: 'concurrency_limit_exceeded',
+                  message: `Account concurrency limit exceeded (${newConcurrency}/${maxConcurrent}), please retry later`
+                }
+              })
+            )
+            responseStream.end()
+            return
+          }
+
+          logger.debug(
+            `🔒 Acquired concurrency slot for stream account ${account.name || accountId}: ${newConcurrency}/${maxConcurrent} (request: ${concurrencyRequestId}, type: ${isUserMessage ? 'user message' : 'tool result'})`
+          )
+
+          // 🔄 启动租约刷新定时器（每5分钟刷新一次，防止长连接租约过期）
+          leaseRefreshInterval = setInterval(
+            async () => {
+              try {
+                await redis.refreshConsoleAccountConcurrencyLease(
+                  accountId,
+                  concurrencyRequestId,
+                  600
+                )
+                logger.debug(
+                  `🔄 Refreshed concurrency lease for stream account ${account.name || accountId} (${accountId}), request: ${concurrencyRequestId}`
+                )
+              } catch (refreshError) {
+                logger.error(
+                  `❌ Failed to refresh concurrency lease for stream account ${accountId}:`,
+                  refreshError.message
+                )
+              }
+            },
+            5 * 60 * 1000 // 5分钟
+          )
+        }
+      } else {
+        logger.debug(
+          `⚡ Skipping concurrency check for tool result (excludeToolsFromConcurrency=true)`
+        )
+      }
+
+      // 📊 账号级速率限制（仅对用户消息生效，流式）
+      if (isUserMessage) {
+        const rateLimitResult = await accountRateLimitService.acquireRateLimit(accountId)
+
+        if (!rateLimitResult.acquired && !rateLimitResult.skipped) {
+          // 速率限制超限，释放已获取的并发槽位
+          if (concurrencyAcquired && concurrencyRequestId) {
+            await redis.decrConsoleAccountConcurrency(accountId, concurrencyRequestId)
+            concurrencyAcquired = false
+            // 清理租约刷新定时器
+            if (leaseRefreshInterval) {
+              clearInterval(leaseRefreshInterval)
+              leaseRefreshInterval = null
+            }
+            logger.debug(
+              `🔓 Released concurrency slot due to rate limit for stream account ${accountId}, request: ${concurrencyRequestId}`
+            )
+          }
+
+          // 返回429错误
+          logger.warn(
+            `⏳ Account rate limit exceeded for stream account ${accountId}: ${rateLimitResult.error}`,
+            { requestId: rateLimitResult.requestId }
+          )
+
+          if (!responseStream.headersSent) {
+            responseStream.status(429)
+            responseStream.setHeader('Content-Type', 'application/json')
+          }
+          responseStream.write(
+            JSON.stringify({
+              type: 'error',
+              error: {
+                type: 'rate_limit_exceeded',
+                message: 'Account rate limit exceeded, please retry later'
+              }
+            })
+          )
+          responseStream.end()
+          return
+        }
+
+        if (rateLimitResult.acquired) {
+          rateLimitAcquired = true
+          rateLimitRequestId = rateLimitResult.requestId
+          logger.debug(`📊 Acquired rate limit slot for stream account ${accountId}`, {
+            requestId: rateLimitRequestId,
+            waitedMs: rateLimitResult.waitedMs || 0
+          })
+        }
+      }
+
       const isDedicatedOfficialAccount =
         accountType === 'claude-official' &&
         apiKeyData.claudeAccountId &&
@@ -1440,6 +1735,54 @@ class ClaudeRelayService {
       // 获取有效的访问token
       const accessToken = await claudeAccountService.getValidAccessToken(accountId)
 
+      // 🛡️ 同秒请求防护：确保同一账户不会在同一秒内发送多次请求（流式）
+      if (config.claude.sameSecondRequestGuard?.enabled !== false) {
+        const maxWait = config.claude.sameSecondRequestGuard?.maxWaitMs || 1000
+        const guardResult = await sameSecondRequestGuard.checkAndWait(accountId, accountType, maxWait)
+        if (!guardResult.allowed) {
+          logger.warn(
+            `🚫 [Stream] Same-second request rejected for account ${accountId} (${accountType}), wait time exceeded threshold`
+          )
+
+          // 释放已获取的资源
+          if (rateLimitAcquired && rateLimitRequestId) {
+            await accountRateLimitService.releaseRateLimit(accountId, rateLimitRequestId)
+            rateLimitAcquired = false
+          }
+          if (concurrencyAcquired && concurrencyRequestId) {
+            await redis.decrConsoleAccountConcurrency(accountId, concurrencyRequestId)
+            concurrencyAcquired = false
+            // 清理租约刷新定时器
+            if (leaseRefreshInterval) {
+              clearInterval(leaseRefreshInterval)
+              leaseRefreshInterval = null
+            }
+          }
+
+          if (!responseStream.headersSent) {
+            responseStream.status(429)
+            responseStream.setHeader('Content-Type', 'application/json')
+          }
+          responseStream.write(
+            JSON.stringify({
+              type: 'error',
+              error: {
+                type: 'same_second_request_blocked',
+                message: 'Too many requests in the same second, please retry'
+              }
+            })
+          )
+          responseStream.end()
+          return
+        }
+
+        if (guardResult.waitedMs > 0) {
+          logger.info(
+            `⏱️ [Stream] Same-second guard waited ${guardResult.waitedMs}ms for account ${accountId} (${accountType})`
+          )
+        }
+      }
+
       const processedBody = this._processRequestBody(requestBody, account)
 
       // 获取代理配置
@@ -1469,6 +1812,42 @@ class ClaudeRelayService {
       logger.error(`❌ Claude stream relay with usage capture failed:`, error)
       throw error
     } finally {
+      // 🔄 停止租约刷新定时器
+      if (leaseRefreshInterval) {
+        clearInterval(leaseRefreshInterval)
+        logger.debug(`⏹️ Stopped concurrency lease refresh interval`)
+      }
+
+      // 🔓 并发控制：释放并发槽位
+      if (concurrencyAcquired && concurrencyRequestId && selectedAccountId) {
+        try {
+          await redis.decrConsoleAccountConcurrency(selectedAccountId, concurrencyRequestId)
+          logger.debug(
+            `🔓 Released concurrency slot for stream account ${selectedAccountId}, request: ${concurrencyRequestId}`
+          )
+        } catch (releaseError) {
+          logger.error(
+            `❌ Failed to release concurrency slot for stream account ${selectedAccountId}:`,
+            releaseError.message
+          )
+        }
+      }
+
+      // 📊 释放速率限制槽位（客户端断开或错误时，流式）
+      if (rateLimitAcquired && rateLimitRequestId && selectedAccountId) {
+        try {
+          await accountRateLimitService.releaseRateLimit(selectedAccountId, rateLimitRequestId)
+          logger.debug(
+            `📊 Released rate limit slot for stream account ${selectedAccountId}, request: ${rateLimitRequestId}`
+          )
+        } catch (releaseError) {
+          logger.error(
+            `❌ Failed to release rate limit slot for stream account ${selectedAccountId}:`,
+            releaseError.message
+          )
+        }
+      }
+
       // 📬 释放用户消息队列锁
       if (queueLockAcquired && queueRequestId && selectedAccountId) {
         try {
@@ -1636,36 +2015,43 @@ class ClaudeRelayService {
                 )
               }
             } else if (res.statusCode === 403) {
-              logger.error(
-                `🚫 [Stream] Forbidden error (403) detected for account ${accountId}, marking as blocked`
+              // 403错误触发熔断机制
+              logger.warn(
+                `🚫 [Stream] Forbidden error (403) detected for account ${accountId} - triggering circuit breaker`
               )
-              await unifiedClaudeScheduler.markAccountBlocked(accountId, accountType, sessionHash)
-            } else if (res.statusCode === 529) {
-              logger.warn(`🚫 [Stream] Overload error (529) detected for account ${accountId}`)
 
-              // 检查是否启用了529错误处理
-              if (config.claude.overloadHandling.enabled > 0) {
-                try {
-                  await claudeAccountService.markAccountOverloaded(accountId)
-                  logger.info(
-                    `🚫 [Stream] Account ${accountId} marked as overloaded for ${config.claude.overloadHandling.enabled} minutes`
-                  )
-                } catch (overloadError) {
-                  logger.error(
-                    `❌ [Stream] Failed to mark account as overloaded: ${accountId}`,
-                    overloadError
-                  )
-                }
+              // 记录403错误并检查是否触发熔断
+              const breakerResult = await error403CircuitBreakerService.record403Error(accountId)
+
+              if (breakerResult.triggered) {
+                // 熔断器触发，标记账户为blocked
+                logger.error(
+                  `🔥 [Stream] Circuit breaker TRIGGERED for account ${accountId}, marking as blocked`,
+                  {
+                    errorCount: breakerResult.errorCount,
+                    threshold: breakerResult.threshold
+                  }
+                )
+                await unifiedClaudeScheduler.markAccountBlocked(accountId, accountType, sessionHash)
               } else {
-                logger.info(
-                  `🚫 [Stream] 529 error handling is disabled, skipping account overload marking`
+                logger.warn(
+                  `⚠️  [Stream] Account ${accountId} has ${breakerResult.errorCount}/${breakerResult.threshold} 403 errors`,
+                  {
+                    errorCount: breakerResult.errorCount,
+                    threshold: breakerResult.threshold
+                  }
                 )
               }
-            } else if (res.statusCode >= 500 && res.statusCode < 600) {
+            } else if (res.statusCode === 529) {
+              // 529是服务过载，只记录日志，不标记账号
               logger.warn(
-                `🔥 [Stream] Server error (${res.statusCode}) detected for account ${accountId}`
+                `🚫 [Stream] Overload error (529) detected for account ${accountId} - temporary, not marking account`
               )
-              await this._handleServerError(accountId, res.statusCode, sessionHash, '[Stream]')
+            } else if (res.statusCode >= 500 && res.statusCode < 600) {
+              // 5xx是服务器错误，只记录日志，不标记账号
+              logger.warn(
+                `🔥 [Stream] Server error (${res.statusCode}) detected for account ${accountId} - temporary, not marking account`
+              )
             }
           }
 
@@ -1689,23 +2075,10 @@ class ClaudeRelayService {
               errorData
             )
             if (this._isOrganizationDisabledError(res.statusCode, errorData)) {
-              ;(async () => {
-                try {
-                  logger.error(
-                    `🚫 [Stream] Organization disabled error (400) detected for account ${accountId}, marking as blocked`
-                  )
-                  await unifiedClaudeScheduler.markAccountBlocked(
-                    accountId,
-                    accountType,
-                    sessionHash
-                  )
-                } catch (markError) {
-                  logger.error(
-                    `❌ [Stream] Failed to mark account ${accountId} as blocked after organization disabled error:`,
-                    markError
-                  )
-                }
-              })()
+              // 组织禁用错误，只记录日志，不标记账号
+              logger.error(
+                `🚫 [Stream] Organization disabled error (400) detected for account ${accountId} - logging only, not marking account`
+              )
             }
             if (!responseStream.destroyed) {
               // 解析 Claude API 返回的错误详情
@@ -2186,24 +2559,22 @@ class ClaudeRelayService {
         `⏱️ ${prefix}${isTimeout ? 'Timeout' : 'Server'} error for account ${accountId}, error count: ${errorCount}/${threshold}`
       )
 
-      // 标记账户为临时不可用（5分钟）
-      try {
-        await unifiedClaudeScheduler.markAccountTemporarilyUnavailable(
-          accountId,
-          accountType,
-          sessionHash,
-          300
-        )
-      } catch (markError) {
-        logger.error(`❌ Failed to mark account temporarily unavailable: ${accountId}`, markError)
-      }
-
-      if (errorCount > threshold) {
+      // 只有达到阈值才标记账户为临时不可用（5分钟）
+      if (errorCount >= threshold) {
         const errorTypeLabel = isTimeout ? 'timeout' : '5xx'
-        // ⚠️ 只记录5xx/504告警，不再自动停止调度，避免上游抖动导致误停
-        logger.error(
-          `❌ ${prefix}Account ${accountId} exceeded ${errorTypeLabel} error threshold (${errorCount} errors), please investigate upstream stability`
+        logger.warn(
+          `⚠️  ${prefix}Account ${accountId} reached ${errorTypeLabel} error threshold (${errorCount}/${threshold}), marking as temporarily unavailable for 5 minutes`
         )
+        try {
+          await unifiedClaudeScheduler.markAccountTemporarilyUnavailable(
+            accountId,
+            accountType,
+            sessionHash,
+            300
+          )
+        } catch (markError) {
+          logger.error(`❌ Failed to mark account temporarily unavailable: ${accountId}`, markError)
+        }
       }
     } catch (handlingError) {
       logger.error(`❌ Failed to handle ${context} server error:`, handlingError)

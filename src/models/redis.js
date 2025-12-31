@@ -285,6 +285,7 @@ class RedisClient {
       sortBy = 'createdAt',
       sortOrder = 'desc',
       excludeDeleted = true, // 默认排除已删除的 API Keys
+      excludeHidden = true, // 默认排除隐身的 API Keys
       modelFilter = []
     } = options
 
@@ -300,6 +301,11 @@ class RedisClient {
     // 排除已删除的 API Keys（默认行为）
     if (excludeDeleted) {
       filteredKeys = filteredKeys.filter((k) => !k.isDeleted)
+    }
+
+    // 排除隐身的 API Keys（默认行为）
+    if (excludeHidden) {
+      filteredKeys = filteredKeys.filter((k) => k.isHidden !== 'true')
     }
 
     // 状态筛选
@@ -2798,6 +2804,261 @@ redisClient.scanUserMessageQueueLocks = async function () {
   } catch (error) {
     logger.error('Failed to scan user message queue locks:', error)
     return []
+  }
+}
+
+// ============================================
+// 账号级速率限制（带排队）
+// ============================================
+
+/**
+ * 获取账号速率限制槽位（使用滑动窗口）
+ * @param {string} accountId - 账户ID
+ * @param {string} requestId - 请求ID
+ * @param {number} windowSeconds - 时间窗口（秒）
+ * @param {number} maxRequests - 最大请求数
+ * @returns {Promise<{acquired: boolean, currentCount: number, oldestRequestTime: number|null}>}
+ */
+redisClient.acquireAccountRateLimit = async function (
+  accountId,
+  requestId,
+  windowSeconds = 60,
+  maxRequests = 20
+) {
+  const key = `account_rate_limit:${accountId}`
+  const now = Date.now()
+  const windowStart = now - windowSeconds * 1000
+  const ttl = (windowSeconds + 60) * 1000 // 窗口大小 + 60秒缓冲
+
+  const luaScript = `
+    local key = KEYS[1]
+    local requestId = ARGV[1]
+    local now = tonumber(ARGV[2])
+    local windowStart = tonumber(ARGV[3])
+    local maxRequests = tonumber(ARGV[4])
+    local ttl = tonumber(ARGV[5])
+
+    -- 清理窗口外的旧请求
+    redis.call('ZREMRANGEBYSCORE', key, '-inf', windowStart)
+
+    -- 检查当前计数
+    local currentCount = redis.call('ZCARD', key)
+
+    if currentCount < maxRequests then
+      -- 未超限，添加新请求
+      redis.call('ZADD', key, now, requestId)
+
+      -- 设置过期时间
+      if ttl > 0 then
+        redis.call('PEXPIRE', key, ttl)
+      end
+
+      return {1, currentCount + 1, nil}
+    else
+      -- 已超限，获取最旧请求的时间
+      local oldestRequest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+      local oldestTime = oldestRequest[2] and tonumber(oldestRequest[2]) or nil
+
+      return {0, currentCount, oldestTime}
+    end
+  `
+
+  try {
+    const result = await this.client.eval(
+      luaScript,
+      1,
+      key,
+      requestId,
+      now,
+      windowStart,
+      maxRequests,
+      ttl
+    )
+
+    const acquired = result[0] === 1
+    const currentCount = result[1]
+    const oldestRequestTime = result[2]
+
+    if (acquired) {
+      logger.debug(
+        `✅ Rate limit acquired for account ${accountId}: ${currentCount}/${maxRequests}`,
+        { requestId }
+      )
+    } else {
+      logger.debug(
+        `⏳ Rate limit exceeded for account ${accountId}: ${currentCount}/${maxRequests}`,
+        { requestId, oldestRequestTime }
+      )
+    }
+
+    return { acquired, currentCount, oldestRequestTime }
+  } catch (error) {
+    logger.error(`Failed to acquire rate limit for account ${accountId}:`, error)
+    throw error
+  }
+}
+
+/**
+ * 释放账号速率限制槽位（手动释放，通常依赖自动过期）
+ * @param {string} accountId - 账户ID
+ * @param {string} requestId - 请求ID
+ * @returns {Promise<boolean>} 是否成功释放
+ */
+redisClient.releaseAccountRateLimit = async function (accountId, requestId) {
+  const key = `account_rate_limit:${accountId}`
+
+  try {
+    const removed = await this.client.zrem(key, requestId)
+    if (removed > 0) {
+      logger.debug(`🔓 Rate limit released for account ${accountId}`, { requestId })
+      return true
+    }
+    return false
+  } catch (error) {
+    logger.error(`Failed to release rate limit for account ${accountId}:`, error)
+    return false
+  }
+}
+
+/**
+ * 获取账号速率限制状态
+ * @param {string} accountId - 账户ID
+ * @param {number} windowSeconds - 时间窗口（秒）
+ * @returns {Promise<{currentCount: number, oldestRequestTime: number|null}>}
+ */
+redisClient.getAccountRateLimitStatus = async function (accountId, windowSeconds = 60) {
+  const key = `account_rate_limit:${accountId}`
+  const now = Date.now()
+  const windowStart = now - windowSeconds * 1000
+
+  const luaScript = `
+    local key = KEYS[1]
+    local windowStart = tonumber(ARGV[1])
+
+    -- 清理窗口外的旧请求
+    redis.call('ZREMRANGEBYSCORE', key, '-inf', windowStart)
+
+    -- 获取当前计数
+    local currentCount = redis.call('ZCARD', key)
+
+    -- 获取最旧请求时间
+    local oldestRequest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+    local oldestTime = oldestRequest[2] and tonumber(oldestRequest[2]) or nil
+
+    return {currentCount, oldestTime}
+  `
+
+  try {
+    const result = await this.client.eval(luaScript, 1, key, windowStart)
+    return {
+      currentCount: result[0],
+      oldestRequestTime: result[1]
+    }
+  } catch (error) {
+    logger.error(`Failed to get rate limit status for account ${accountId}:`, error)
+    return { currentCount: 0, oldestRequestTime: null }
+  }
+}
+
+// ============================================
+// 403错误熔断机制 - 错误追踪
+// ============================================
+
+/**
+ * 记录403错误到账户错误历史（使用滑动窗口）
+ * @param {string} accountId - 账户ID
+ * @param {number} windowSeconds - 时间窗口（秒）
+ * @returns {Promise<number>} 窗口内的错误计数
+ */
+redisClient.record403Error = async function (accountId, windowSeconds = 300) {
+  const key = `error_403_history:${accountId}`
+  const now = Date.now()
+  const errorId = `${now}-${Math.random().toString(36).substr(2, 9)}`
+  const windowStart = now - windowSeconds * 1000
+  const ttl = (windowSeconds + 60) * 1000 // 窗口大小 + 60秒缓冲
+
+  const luaScript = `
+    local key = KEYS[1]
+    local errorId = ARGV[1]
+    local now = tonumber(ARGV[2])
+    local windowStart = tonumber(ARGV[3])
+    local ttl = tonumber(ARGV[4])
+
+    -- 清理窗口外的旧错误
+    redis.call('ZREMRANGEBYSCORE', key, '-inf', windowStart)
+
+    -- 添加新错误记录
+    redis.call('ZADD', key, now, errorId)
+
+    -- 设置过期时间
+    if ttl > 0 then
+      redis.call('PEXPIRE', key, ttl)
+    end
+
+    -- 返回窗口内的错误计数
+    local count = redis.call('ZCARD', key)
+    return count
+  `
+
+  try {
+    const count = await this.client.eval(luaScript, 1, key, errorId, now, windowStart, ttl)
+    logger.debug(
+      `🚫 Recorded 403 error for account ${accountId}: ${count} errors in ${windowSeconds}s window`
+    )
+    return count
+  } catch (error) {
+    logger.error(`Failed to record 403 error for account ${accountId}:`, error)
+    throw error
+  }
+}
+
+/**
+ * 获取账户在时间窗口内的403错误计数
+ * @param {string} accountId - 账户ID
+ * @param {number} windowSeconds - 时间窗口（秒）
+ * @returns {Promise<number>} 错误计数
+ */
+redisClient.get403ErrorCount = async function (accountId, windowSeconds = 300) {
+  const key = `error_403_history:${accountId}`
+  const now = Date.now()
+  const windowStart = now - windowSeconds * 1000
+
+  const luaScript = `
+    local key = KEYS[1]
+    local windowStart = tonumber(ARGV[1])
+
+    -- 清理窗口外的旧错误
+    redis.call('ZREMRANGEBYSCORE', key, '-inf', windowStart)
+
+    -- 返回窗口内的错误计数
+    local count = redis.call('ZCARD', key)
+    return count
+  `
+
+  try {
+    const count = await this.client.eval(luaScript, 1, key, windowStart)
+    return count
+  } catch (error) {
+    logger.error(`Failed to get 403 error count for account ${accountId}:`, error)
+    return 0
+  }
+}
+
+/**
+ * 清除账户的所有403错误记录
+ * @param {string} accountId - 账户ID
+ * @returns {Promise<boolean>} 是否成功清除
+ */
+redisClient.clear403Errors = async function (accountId) {
+  const key = `error_403_history:${accountId}`
+
+  try {
+    await this.client.del(key)
+    logger.debug(`🧹 Cleared 403 error history for account ${accountId}`)
+    return true
+  } catch (error) {
+    logger.error(`Failed to clear 403 errors for account ${accountId}:`, error)
+    return false
   }
 }
 

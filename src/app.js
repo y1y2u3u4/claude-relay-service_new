@@ -169,7 +169,7 @@ class Application {
       // 🔧 基础中间件
       this.app.use(
         express.json({
-          limit: '10mb',
+          limit: '100mb',
           verify: (req, res, buf, encoding) => {
             // 验证JSON格式
             if (buf && buf.length && !buf.toString(encoding || 'utf8').trim()) {
@@ -178,7 +178,7 @@ class Application {
           }
         })
       )
-      this.app.use(express.urlencoded({ extended: true, limit: '10mb' }))
+      this.app.use(express.urlencoded({ extended: true, limit: '100mb' }))
       this.app.use(securityMiddleware)
 
       // 🎯 信任代理
@@ -707,6 +707,11 @@ class Application {
       // 然后启动定时清理任务
       userMessageQueueService.startCleanupTask()
     })
+
+    // 🔥 启动403错误熔断机制自动恢复任务
+    const error403CircuitBreakerService = require('./services/error403CircuitBreakerService')
+    error403CircuitBreakerService.startAutoRecoveryTask()
+    logger.info('🔥 403 Circuit Breaker auto-recovery task started')
   }
 
   setupGracefulShutdown() {

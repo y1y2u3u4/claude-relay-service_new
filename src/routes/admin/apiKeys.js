@@ -283,7 +283,8 @@ router.get('/api-keys', authenticateAdmin, async (req, res) => {
         isActive,
         sortBy: validSortBy,
         sortOrder: validSortOrder,
-        modelFilter
+        modelFilter,
+        excludeHidden: true // 明确排除隐身 API Keys
       })
     }
 
@@ -369,7 +370,9 @@ async function getApiKeysSortedByCostPrecomputed(options) {
 
   // 3. 保持排序顺序（使用 Map 优化查找）
   const keyMap = new Map(allKeys.map((k) => [k.id, k]))
-  let orderedKeys = rankedKeyIds.map((id) => keyMap.get(id)).filter((k) => k && !k.isDeleted)
+  let orderedKeys = rankedKeyIds
+    .map((id) => keyMap.get(id))
+    .filter((k) => k && !k.isDeleted && k.isHidden !== 'true') // 排除已删除和隐身的 Key
 
   // 4. 应用筛选条件
   // 状态筛选
@@ -484,7 +487,9 @@ async function getApiKeysSortedByCostCustom(options) {
 
   // 4. 保持排序顺序
   const keyMap = new Map(allKeys.map((k) => [k.id, k]))
-  let orderedKeys = rankedKeyIds.map((id) => keyMap.get(id)).filter((k) => k && !k.isDeleted)
+  let orderedKeys = rankedKeyIds
+    .map((id) => keyMap.get(id))
+    .filter((k) => k && !k.isDeleted && k.isHidden !== 'true') // 排除已删除和隐身的 Key
 
   // 5. 应用筛选条件
   // 状态筛选

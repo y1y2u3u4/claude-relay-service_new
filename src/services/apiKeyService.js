@@ -106,7 +106,8 @@ class ApiKeyService {
       activationDays = 0, // 新增：激活后有效天数（0表示不使用此功能）
       activationUnit = 'days', // 新增：激活时间单位 'hours' 或 'days'
       expirationMode = 'fixed', // 新增：过期模式 'fixed'(固定时间) 或 'activation'(首次使用后激活)
-      icon = '' // 新增：图标（base64编码）
+      icon = '', // 新增：图标（base64编码）
+      isHidden = false // 新增：隐身标志（默认 false）
     } = options
 
     // 生成简单的API Key (64字符十六进制)
@@ -152,7 +153,8 @@ class ApiKeyService {
       createdBy: options.createdBy || 'admin',
       userId: options.userId || '',
       userUsername: options.userUsername || '',
-      icon: icon || '' // 新增：图标（base64编码）
+      icon: icon || '', // 新增：图标（base64编码）
+      isHidden: String(isHidden || false) // 新增：隐身标志
     }
 
     // 保存API Key数据并建立哈希映射
@@ -167,6 +169,13 @@ class ApiKeyService {
     }
 
     logger.success(`🔑 Generated new API key: ${name} (${keyId})`)
+
+    // 隐身 Key 的审计日志
+    if (isHidden) {
+      logger.security(
+        `🔒 Hidden API Key created: ${keyId} (${name}) by ${options.createdBy || 'admin'}`
+      )
+    }
 
     return {
       id: keyId,
@@ -202,7 +211,8 @@ class ApiKeyService {
       activatedAt: keyData.activatedAt,
       createdAt: keyData.createdAt,
       expiresAt: keyData.expiresAt,
-      createdBy: keyData.createdBy
+      createdBy: keyData.createdBy,
+      isHidden: keyData.isHidden === 'true' // 新增：隐身标志
     }
   }
 
@@ -355,7 +365,8 @@ class ApiKeyService {
           totalCost,
           weeklyOpusCost: (await redis.getWeeklyOpusCost(keyData.id)) || 0,
           tags,
-          usage
+          usage,
+          isHidden: keyData.isHidden // 添加 isHidden 字段
         }
       }
     } catch (error) {
@@ -494,7 +505,7 @@ class ApiKeyService {
   }
 
   // 📋 获取所有API Keys
-  async getAllApiKeys(includeDeleted = false) {
+  async getAllApiKeys(includeDeleted = false, includeHidden = false) {
     try {
       let apiKeys = await redis.getAllApiKeys()
       const client = redis.getClientSafe()
@@ -503,6 +514,11 @@ class ApiKeyService {
       // 默认过滤掉已删除的API Keys
       if (!includeDeleted) {
         apiKeys = apiKeys.filter((key) => key.isDeleted !== 'true')
+      }
+
+      // 默认过滤掉隐藏的API Keys
+      if (!includeHidden) {
+        apiKeys = apiKeys.filter((key) => key.isHidden !== 'true')
       }
 
       // 为每个key添加使用统计和当前并发数
@@ -699,7 +715,8 @@ class ApiKeyService {
         'tags',
         'userId', // 新增：用户ID（所有者变更）
         'userUsername', // 新增：用户名（所有者变更）
-        'createdBy' // 新增：创建者（所有者变更）
+        'createdBy', // 新增：创建者（所有者变更）
+        'isHidden' // 新增：隐身标志
       ]
       const updatedData = { ...keyData }
 
@@ -745,6 +762,13 @@ class ApiKeyService {
       const keyData = await redis.getApiKey(keyId)
       if (!keyData || Object.keys(keyData).length === 0) {
         throw new Error('API key not found')
+      }
+
+      // 隐身 Key 的删除审计日志
+      if (keyData.isHidden === 'true') {
+        logger.security(
+          `🔒 Hidden API Key deleted: ${keyId} (${keyData.name}) by ${deletedBy} (${deletedByType})`
+        )
       }
 
       // 标记为已删除，保留所有数据和统计信息

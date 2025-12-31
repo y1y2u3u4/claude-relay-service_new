@@ -5,6 +5,7 @@ const ccrAccountService = require('./ccrAccountService')
 const accountGroupService = require('./accountGroupService')
 const redis = require('../models/redis')
 const logger = require('../utils/logger')
+const config = require('../../config/config')
 const { parseVendorPrefixedModel, isOpus45OrNewer } = require('../utils/modelHelper')
 
 /**
@@ -425,6 +426,16 @@ class UnifiedClaudeScheduler {
       )
 
       if (availableAccounts.length === 0) {
+        // 检查是否因为所有账号都被限流导致的
+        const rateLimitInfo = await this._checkAllAccountsRateLimited(effectiveModel)
+        if (rateLimitInfo.allRateLimited) {
+          const error = new Error('All Claude accounts are rate limited')
+          error.code = 'ALL_ACCOUNTS_RATE_LIMITED'
+          error.rateLimitEndAt = rateLimitInfo.earliestResetTime
+          error.isOpusLimit = rateLimitInfo.isOpusLimit
+          throw error
+        }
+
         // 提供更详细的错误信息
         if (effectiveModel) {
           throw new Error(
@@ -484,7 +495,8 @@ class UnifiedClaudeScheduler {
         boundAccount.isActive === 'true' &&
         boundAccount.status !== 'error' &&
         boundAccount.status !== 'blocked' &&
-        boundAccount.status !== 'temp_error'
+        boundAccount.status !== 'temp_error' &&
+        boundAccount.error403BreakerState !== 'open' // 排除403熔断打开的账户
       ) {
         const isRateLimited = await claudeAccountService.isAccountRateLimited(boundAccount.id)
         if (isRateLimited) {
@@ -608,6 +620,7 @@ class UnifiedClaudeScheduler {
         account.status !== 'error' &&
         account.status !== 'blocked' &&
         account.status !== 'temp_error' &&
+        account.error403BreakerState !== 'open' && // 排除403熔断打开的账户
         (account.accountType === 'shared' || !account.accountType) && // 兼容旧数据
         this._isSchedulable(account.schedulable)
       ) {
@@ -1014,6 +1027,22 @@ class UnifiedClaudeScheduler {
           }
         }
 
+        // 检查并发限制（账户级别）
+        // 优先使用账户自己的配置，否则使用全局默认配置
+        const maxConcurrent =
+          Number(account.maxConcurrentTasks) || config.claude.defaultMaxConcurrentTasks || 0
+        if (maxConcurrent > 0) {
+          // 注意：实际的并发检查会在 claudeRelayService 中进行
+          // 这里只是预检查，真正的并发计数由 relay service 管理
+          const currentConcurrency = await redis.getConsoleAccountConcurrency(accountId)
+          if (currentConcurrency >= maxConcurrent) {
+            logger.info(
+              `🚫 Claude official account ${accountId} (${account.name || 'unknown'}) reached concurrency limit: ${currentConcurrency}/${maxConcurrent} (account: ${account.maxConcurrentTasks || 'default'}, global: ${config.claude.defaultMaxConcurrentTasks})`
+            )
+            return false
+          }
+        }
+
         return true
       } else if (accountType === 'claude-console') {
         const account = await claudeConsoleAccountService.getAccount(accountId)
@@ -1369,6 +1398,71 @@ class UnifiedClaudeScheduler {
     }
   }
 
+  // 🔍 检查是否所有账号都被限流（用于返回友好的限流错误信息）
+  async _checkAllAccountsRateLimited(requestedModel) {
+    try {
+      const allAccounts = await redis.getAllClaudeAccounts()
+      if (!allAccounts || allAccounts.length === 0) {
+        return { allRateLimited: false }
+      }
+
+      // 筛选出活跃且可调度的账号
+      const activeAccounts = allAccounts.filter(
+        (account) =>
+          account.isActive === 'true' &&
+          account.status !== 'blocked' &&
+          account.status !== 'unauthorized' &&
+          account.error403BreakerState !== 'open' && // 排除403熔断打开的账户
+          this._isSchedulable(account.schedulable)
+      )
+
+      if (activeAccounts.length === 0) {
+        return { allRateLimited: false }
+      }
+
+      // 检查每个账号的限流状态
+      let rateLimitedCount = 0
+      let earliestResetTime = null
+      let isOpusLimit = false
+
+      for (const account of activeAccounts) {
+        const isRateLimited = await claudeAccountService.isAccountRateLimited(account.id)
+        if (isRateLimited) {
+          rateLimitedCount++
+          const rateLimitInfo = await claudeAccountService.getAccountRateLimitInfo(account.id)
+          if (rateLimitInfo?.rateLimitEndAt) {
+            const resetTime = new Date(rateLimitInfo.rateLimitEndAt).getTime()
+            if (!earliestResetTime || resetTime < earliestResetTime) {
+              earliestResetTime = resetTime
+            }
+          }
+          // 检查是否是Opus限流
+          if (account.opusRateLimitedAt) {
+            isOpusLimit = true
+          }
+        }
+      }
+
+      // 如果所有活跃账号都被限流
+      if (rateLimitedCount > 0 && rateLimitedCount === activeAccounts.length) {
+        logger.warn(
+          `⚠️ All ${rateLimitedCount} active Claude accounts are rate limited, earliest reset: ${earliestResetTime ? new Date(earliestResetTime).toISOString() : 'unknown'}`
+        )
+        return {
+          allRateLimited: true,
+          earliestResetTime: earliestResetTime ? new Date(earliestResetTime).toISOString() : null,
+          isOpusLimit,
+          rateLimitedCount
+        }
+      }
+
+      return { allRateLimited: false }
+    } catch (error) {
+      logger.error('❌ Failed to check all accounts rate limit status:', error)
+      return { allRateLimited: false }
+    }
+  }
+
   // 🚫 标记账户为未授权状态（401错误）
   async markAccountUnauthorized(accountId, accountType, sessionHash = null) {
     try {
@@ -1544,7 +1638,10 @@ class UnifiedClaudeScheduler {
               ? account.status === 'active'
               : account.status === 'active'
 
-        if (isActive && status && this._isSchedulable(account.schedulable)) {
+        // 检查403熔断状态
+        const notCircuitBroken = account.error403BreakerState !== 'open'
+
+        if (isActive && status && notCircuitBroken && this._isSchedulable(account.schedulable)) {
           // 检查模型支持
           if (!this._isModelSupportedByAccount(account, accountType, requestedModel, 'in group')) {
             continue

@@ -233,6 +233,14 @@ async function handleChatCompletion(req, res, apiKeyData) {
           message: limitMessage
         })
       }
+      // 处理共享账号池所有账号都被限流的情况
+      if (error.code === 'ALL_ACCOUNTS_RATE_LIMITED') {
+        const limitMessage = claudeRelayService._buildStandardRateLimitMessage(error.rateLimitEndAt)
+        return res.status(403).json({
+          error: 'upstream_rate_limited',
+          message: limitMessage
+        })
+      }
       throw error
     }
     const { accountId } = accountSelection

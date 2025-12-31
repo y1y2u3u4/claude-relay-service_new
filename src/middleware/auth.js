@@ -172,6 +172,74 @@ const authenticateApiKey = async (req, res, next) => {
 
     const skipKeyRestrictions = isTokenCountRequest(req)
 
+    // 🔢 Token Count 专用限流
+    if (skipKeyRestrictions) {
+      const tokenCountLimit = 60 // 每分钟最多 60 次 token count
+      const tokenCountWindow = 60 // 60 秒窗口
+
+      const tokenCountKey = `rate_limit:token_count:${validation.keyData.id}`
+      const client = redis.getClient()
+      const currentCount = await client.incr(tokenCountKey)
+
+      if (currentCount === 1) {
+        await client.expire(tokenCountKey, tokenCountWindow)
+      }
+
+      if (currentCount > tokenCountLimit) {
+        logger.security(
+          `🚦 Token count rate limit exceeded for key: ${validation.keyData.id} (${validation.keyData.name}), count: ${currentCount}, limit: ${tokenCountLimit}`
+        )
+        return res.status(429).json({
+          error: 'Token count rate limit exceeded',
+          message: `Too many token count requests. Limit: ${tokenCountLimit} requests per minute`,
+          currentCount: currentCount,
+          limit: tokenCountLimit,
+          retryAfter: tokenCountWindow
+        })
+      }
+
+      logger.debug(
+        `✅ Token count rate limit check passed for key: ${validation.keyData.id} (${validation.keyData.name}), count: ${currentCount}/${tokenCountLimit}`
+      )
+    }
+
+    // 📊 GET 端点专用限流（防止查询类接口被滥用）
+    const isLightweightGetRequest =
+      req.method === 'GET' &&
+      (req.path.includes('/models') ||
+        req.path.includes('/usage') ||
+        req.path.includes('/key-info'))
+
+    if (isLightweightGetRequest) {
+      const getLimit = 120 // 每分钟最多 120 次 GET 请求
+      const getWindow = 60 // 60 秒窗口
+
+      const getLimitKey = `rate_limit:get:${validation.keyData.id}`
+      const client = redis.getClient()
+      const currentCount = await client.incr(getLimitKey)
+
+      if (currentCount === 1) {
+        await client.expire(getLimitKey, getWindow)
+      }
+
+      if (currentCount > getLimit) {
+        logger.security(
+          `🚦 GET endpoint rate limit exceeded for key: ${validation.keyData.id} (${validation.keyData.name}), count: ${currentCount}, limit: ${getLimit}, path: ${req.path}`
+        )
+        return res.status(429).json({
+          error: 'GET endpoint rate limit exceeded',
+          message: `Too many GET requests. Limit: ${getLimit} requests per minute`,
+          currentCount: currentCount,
+          limit: getLimit,
+          retryAfter: getWindow
+        })
+      }
+
+      logger.debug(
+        `✅ GET endpoint rate limit check passed for key: ${validation.keyData.id} (${validation.keyData.name}), count: ${currentCount}/${getLimit}, path: ${req.path}`
+      )
+    }
+
     // 🔒 检查客户端限制（使用新的验证器）
     if (
       !skipKeyRestrictions &&
@@ -1388,7 +1456,7 @@ const globalRateLimit = async (req, res, next) =>
 
 // 📊 请求大小限制中间件
 const requestSizeLimit = (req, res, next) => {
-  const maxSize = 60 * 1024 * 1024 // 60MB
+  const maxSize = 100 * 1024 * 1024 // 100MB
   const contentLength = parseInt(req.headers['content-length'] || '0')
 
   if (contentLength > maxSize) {
@@ -1396,7 +1464,7 @@ const requestSizeLimit = (req, res, next) => {
     return res.status(413).json({
       error: 'Payload Too Large',
       message: 'Request body size exceeds limit',
-      limit: '10MB'
+      limit: '100MB'
     })
   }
 

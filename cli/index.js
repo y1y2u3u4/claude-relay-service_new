@@ -1007,6 +1007,524 @@ async function deleteBedrockAccount() {
   }
 }
 
+// 🔒 隐身 API Key 管理
+program
+  .command('hidden-keys')
+  .description('🔒 隐身 API Key 管理（仅限服务器管理员）')
+  .action(async () => {
+    await initialize()
+
+    const { action } = await inquirer.prompt([
+      {
+        type: 'list',
+        name: 'action',
+        message: '请选择操作:',
+        choices: [
+          { name: '➕ 创建隐身 API Key', value: 'create' },
+          { name: '📋 查看隐身 API Keys', value: 'list' },
+          { name: '🔓 转换为普通 Key', value: 'unhide' },
+          { name: '🗑️  删除隐身 Key', value: 'delete' }
+        ]
+      }
+    ])
+
+    switch (action) {
+      case 'create':
+        await createHiddenApiKey()
+        break
+      case 'list':
+        await listHiddenApiKeys()
+        break
+      case 'unhide':
+        await unhideApiKey()
+        break
+      case 'delete':
+        await deleteHiddenApiKey()
+        break
+    }
+
+    await redis.disconnect()
+  })
+
+// 创建隐身 API Key
+async function createHiddenApiKey() {
+  console.log(styles.title('\n➕ 创建隐身 API Key\n'))
+  console.log(styles.warning('⚠️  隐身 API Key 将不会在 Web 管理界面中显示\n'))
+
+  // 0. 选择创建模式
+  const { mode } = await inquirer.prompt([
+    {
+      type: 'list',
+      name: 'mode',
+      message: '选择创建模式:',
+      choices: [
+        { name: '快速创建（无限制，推荐）', value: 'quick' },
+        { name: '高级创建（配置详细限制）', value: 'advanced' }
+      ],
+      default: 'quick'
+    }
+  ])
+
+  // 1. 基本信息
+  const basicInfo = await inquirer.prompt([
+    {
+      type: 'input',
+      name: 'name',
+      message: 'API Key 名称:',
+      validate: (input) => input.length >= 3 || '名称至少3个字符'
+    },
+    {
+      type: 'input',
+      name: 'description',
+      message: '描述:',
+      default: '系统内部服务使用'
+    },
+    {
+      type: 'list',
+      name: 'permissions',
+      message: '服务权限:',
+      choices: [
+        { name: '全部服务', value: 'all' },
+        { name: 'Claude 服务', value: 'claude' },
+        { name: 'Gemini 服务', value: 'gemini' },
+        { name: 'OpenAI 服务', value: 'openai' }
+      ]
+    }
+  ])
+
+  // 快速创建模式：跳过所有额外配置
+  if (mode === 'quick') {
+    const spinner = ora('正在创建隐身 API Key...').start()
+
+    try {
+      const newKey = await apiKeyService.generateApiKey({
+        name: basicInfo.name,
+        description: basicInfo.description,
+        permissions: basicInfo.permissions,
+        isHidden: true,
+        createdBy: 'cli',
+        // 所有限制都设为默认值（无限制）
+        concurrencyLimit: 0,
+        rateLimitWindow: null,
+        rateLimitRequests: null,
+        rateLimitCost: null,
+        dailyCostLimit: 0,
+        totalCostLimit: 0,
+        weeklyOpusCostLimit: 0,
+        expirationMode: 'fixed',
+        expiresAt: null
+      })
+
+      spinner.succeed('隐身 API Key 创建成功')
+
+      console.log(styles.success('\n✅ 创建成功！'))
+      console.log(styles.warning('⚠️  请立即保存以下信息，无法再次查看完整 Key：\n'))
+      console.log(styles.title(`API Key: ${newKey.apiKey}`))
+      console.log(styles.info(`名称: ${newKey.name}`))
+      console.log(styles.info(`ID: ${newKey.id}`))
+      console.log(styles.info(`权限: ${newKey.permissions}`))
+      console.log(styles.info(`限制: 无限制（永不过期）`))
+    } catch (error) {
+      spinner.fail('创建失败')
+      console.error(styles.error(error.message))
+    }
+    return
+  }
+
+  // 2. 并发和速率限制
+  const concurrencyConfig = await inquirer.prompt([
+    {
+      type: 'confirm',
+      name: 'enableConcurrency',
+      message: '是否设置并发限制？',
+      default: false
+    },
+    {
+      type: 'number',
+      name: 'concurrencyLimit',
+      message: '最大并发数:',
+      default: 5,
+      when: (answers) => answers.enableConcurrency,
+      validate: (input) => input > 0 || '并发数必须大于0'
+    },
+    {
+      type: 'confirm',
+      name: 'enableRateLimit',
+      message: '是否设置速率限制？',
+      default: false
+    },
+    {
+      type: 'number',
+      name: 'rateLimitWindow',
+      message: '速率限制时间窗口（秒）:',
+      default: 60,
+      when: (answers) => answers.enableRateLimit,
+      validate: (input) => input > 0 || '时间窗口必须大于0'
+    },
+    {
+      type: 'number',
+      name: 'rateLimitRequests',
+      message: '时间窗口内最大请求数:',
+      default: 100,
+      when: (answers) => answers.enableRateLimit,
+      validate: (input) => input > 0 || '请求数必须大于0'
+    },
+    {
+      type: 'confirm',
+      name: 'enableRateLimitCost',
+      message: '是否设置速率限制费用（美元）？',
+      default: false,
+      when: (answers) => answers.enableRateLimit
+    },
+    {
+      type: 'number',
+      name: 'rateLimitCost',
+      message: '时间窗口内最大费用（美元）:',
+      default: 10.0,
+      when: (answers) => answers.enableRateLimitCost,
+      validate: (input) => input > 0 || '费用必须大于0'
+    }
+  ])
+
+  // 3. 费用限制
+  const costLimits = await inquirer.prompt([
+    {
+      type: 'confirm',
+      name: 'enableDailyCostLimit',
+      message: '是否设置每日费用限制？',
+      default: false
+    },
+    {
+      type: 'number',
+      name: 'dailyCostLimit',
+      message: '每日最大费用（美元）:',
+      default: 50.0,
+      when: (answers) => answers.enableDailyCostLimit,
+      validate: (input) => input > 0 || '费用必须大于0'
+    },
+    {
+      type: 'confirm',
+      name: 'enableTotalCostLimit',
+      message: '是否设置总费用限制？',
+      default: false
+    },
+    {
+      type: 'number',
+      name: 'totalCostLimit',
+      message: '总费用限制（美元）:',
+      default: 1000.0,
+      when: (answers) => answers.enableTotalCostLimit,
+      validate: (input) => input > 0 || '费用必须大于0'
+    },
+    {
+      type: 'confirm',
+      name: 'enableWeeklyOpusCostLimit',
+      message: '是否设置每周 Opus 模型费用限制？',
+      default: false
+    },
+    {
+      type: 'number',
+      name: 'weeklyOpusCostLimit',
+      message: '每周 Opus 模型最大费用（美元）:',
+      default: 100.0,
+      when: (answers) => answers.enableWeeklyOpusCostLimit,
+      validate: (input) => input > 0 || '费用必须大于0'
+    }
+  ])
+
+  // 4. 过期时间配置
+  const expiryConfig = await inquirer.prompt([
+    {
+      type: 'list',
+      name: 'expirationMode',
+      message: '过期模式:',
+      choices: [
+        { name: '永不过期', value: 'never' },
+        { name: '固定过期时间', value: 'fixed' },
+        { name: '首次使用后激活（激活后计时）', value: 'activation' }
+      ],
+      default: 'never'
+    },
+    {
+      type: 'number',
+      name: 'expiryDays',
+      message: '过期天数:',
+      default: 30,
+      when: (answers) => answers.expirationMode === 'fixed',
+      validate: (input) => input > 0 || '天数必须大于0'
+    },
+    {
+      type: 'number',
+      name: 'activationDays',
+      message: '激活后有效天数:',
+      default: 30,
+      when: (answers) => answers.expirationMode === 'activation',
+      validate: (input) => input > 0 || '天数必须大于0'
+    },
+    {
+      type: 'list',
+      name: 'activationUnit',
+      message: '激活时间单位:',
+      choices: [
+        { name: '天', value: 'days' },
+        { name: '小时', value: 'hours' }
+      ],
+      default: 'days',
+      when: (answers) => answers.expirationMode === 'activation'
+    }
+  ])
+
+  const spinner = ora('正在创建隐身 API Key...').start()
+
+  try {
+    // 计算过期时间
+    let expiresAt = null
+    if (expiryConfig.expirationMode === 'fixed' && expiryConfig.expiryDays) {
+      const now = new Date()
+      expiresAt = new Date(now.getTime() + expiryConfig.expiryDays * 24 * 60 * 60 * 1000)
+    }
+
+    // 构建 API Key 创建选项
+    const options = {
+      name: basicInfo.name,
+      description: basicInfo.description,
+      permissions: basicInfo.permissions,
+      isHidden: true, // 关键：设置为隐身
+      createdBy: 'cli',
+      // 并发和速率限制
+      concurrencyLimit: concurrencyConfig.enableConcurrency
+        ? concurrencyConfig.concurrencyLimit
+        : 0,
+      rateLimitWindow: concurrencyConfig.enableRateLimit ? concurrencyConfig.rateLimitWindow : null,
+      rateLimitRequests: concurrencyConfig.enableRateLimit
+        ? concurrencyConfig.rateLimitRequests
+        : null,
+      rateLimitCost: concurrencyConfig.enableRateLimitCost ? concurrencyConfig.rateLimitCost : null,
+      // 费用限制
+      dailyCostLimit: costLimits.enableDailyCostLimit ? costLimits.dailyCostLimit : 0,
+      totalCostLimit: costLimits.enableTotalCostLimit ? costLimits.totalCostLimit : 0,
+      weeklyOpusCostLimit: costLimits.enableWeeklyOpusCostLimit
+        ? costLimits.weeklyOpusCostLimit
+        : 0,
+      // 过期时间配置
+      expirationMode:
+        expiryConfig.expirationMode === 'never' ? 'fixed' : expiryConfig.expirationMode,
+      expiresAt,
+      activationDays:
+        expiryConfig.expirationMode === 'activation' ? expiryConfig.activationDays : 0,
+      activationUnit:
+        expiryConfig.expirationMode === 'activation' ? expiryConfig.activationUnit : 'days'
+    }
+
+    const newKey = await apiKeyService.generateApiKey(options)
+
+    spinner.succeed('隐身 API Key 创建成功')
+
+    console.log(styles.success('\n✅ 创建成功！'))
+    console.log(styles.warning('⚠️  请立即保存以下信息，无法再次查看完整 Key：\n'))
+    console.log(styles.title(`API Key: ${newKey.apiKey}`))
+    console.log(styles.info(`名称: ${newKey.name}`))
+    console.log(styles.info(`ID: ${newKey.id}`))
+    console.log(styles.info(`权限: ${newKey.permissions}`))
+
+    // 显示配置的限制
+    console.log(styles.title('\n📊 配置的限制:'))
+    if (concurrencyConfig.enableConcurrency) {
+      console.log(styles.info(`  并发限制: ${concurrencyConfig.concurrencyLimit}`))
+    }
+    if (concurrencyConfig.enableRateLimit) {
+      console.log(
+        styles.info(
+          `  速率限制: ${concurrencyConfig.rateLimitRequests} 请求/${concurrencyConfig.rateLimitWindow}秒`
+        )
+      )
+      if (concurrencyConfig.enableRateLimitCost) {
+        console.log(
+          styles.info(
+            `  速率费用限制: $${concurrencyConfig.rateLimitCost}/${concurrencyConfig.rateLimitWindow}秒`
+          )
+        )
+      }
+    }
+    if (costLimits.enableDailyCostLimit) {
+      console.log(styles.info(`  每日费用限制: $${costLimits.dailyCostLimit}`))
+    }
+    if (costLimits.enableTotalCostLimit) {
+      console.log(styles.info(`  总费用限制: $${costLimits.totalCostLimit}`))
+    }
+    if (costLimits.enableWeeklyOpusCostLimit) {
+      console.log(styles.info(`  每周 Opus 费用限制: $${costLimits.weeklyOpusCostLimit}`))
+    }
+    if (expiryConfig.expirationMode === 'fixed') {
+      console.log(styles.info(`  过期时间: ${expiresAt.toLocaleString()}`))
+    } else if (expiryConfig.expirationMode === 'activation') {
+      console.log(
+        styles.info(
+          `  激活模式: 首次使用后 ${expiryConfig.activationDays} ${expiryConfig.activationUnit === 'days' ? '天' : '小时'}`
+        )
+      )
+    } else {
+      console.log(styles.info(`  过期时间: 永不过期`))
+    }
+  } catch (error) {
+    spinner.fail('创建失败')
+    console.error(styles.error(error.message))
+  }
+}
+
+// 查看隐身 API Keys
+async function listHiddenApiKeys() {
+  const spinner = ora('正在获取隐身 API Keys...').start()
+
+  try {
+    const allKeys = await apiKeyService.getAllApiKeys()
+    const hiddenKeys = allKeys.filter((k) => k.isHidden === 'true')
+
+    spinner.succeed(`找到 ${hiddenKeys.length} 个隐身 API Keys`)
+
+    if (hiddenKeys.length === 0) {
+      console.log(styles.warning('\n没有找到隐身 API Keys'))
+      return
+    }
+
+    // 获取每个隐身 Key 的费用统计
+    const tableData = [['名称', 'ID', '状态', '权限', '创建时间', '总费用']]
+
+    for (const key of hiddenKeys) {
+      const costStats = await redis.getCostStats(key.id)
+      const totalCost = costStats?.total || 0
+
+      tableData.push([
+        key.name,
+        key.id.substring(0, 16) + '...',
+        key.isActive ? '🟢 活跃' : '🔴 停用',
+        key.permissions || 'all',
+        new Date(key.createdAt).toLocaleDateString(),
+        `$${totalCost.toFixed(2)}` // 显示费用
+      ])
+    }
+
+    console.log(styles.title('\n🔒 隐身 API Keys 列表:\n'))
+    console.log(table(tableData))
+
+    // 显示隐身 Key 的总费用（不计入全局统计）
+    let hiddenTotalCost = 0
+    for (const key of hiddenKeys) {
+      const costStats = await redis.getCostStats(key.id)
+      hiddenTotalCost += costStats?.total || 0
+    }
+    console.log(styles.info(`\n💰 隐身 Keys 总费用: $${hiddenTotalCost.toFixed(2)}`))
+    console.log(styles.warning('⚠️  此费用不计入全局统计'))
+  } catch (error) {
+    spinner.fail('获取失败')
+    console.error(styles.error(error.message))
+  }
+}
+
+// 转换为普通 Key
+async function unhideApiKey() {
+  const spinner = ora('正在获取隐身 API Keys...').start()
+
+  try {
+    const allKeys = await apiKeyService.getAllApiKeys()
+    const hiddenKeys = allKeys.filter((k) => k.isHidden === 'true')
+
+    spinner.stop()
+
+    if (hiddenKeys.length === 0) {
+      console.log(styles.warning('没有找到隐身 API Keys'))
+      return
+    }
+
+    const { selectedKey } = await inquirer.prompt([
+      {
+        type: 'list',
+        name: 'selectedKey',
+        message: '选择要转换为普通 Key 的隐身 Key:',
+        choices: hiddenKeys.map((key) => ({
+          name: `${key.name} (${key.id.substring(0, 16)}...)`,
+          value: key
+        }))
+      }
+    ])
+
+    const { confirm } = await inquirer.prompt([
+      {
+        type: 'confirm',
+        name: 'confirm',
+        message: `确认将 "${selectedKey.name}" 转换为普通 Key？`,
+        default: false
+      }
+    ])
+
+    if (!confirm) {
+      console.log(styles.info('已取消转换'))
+      return
+    }
+
+    const convertSpinner = ora('正在转换...').start()
+    await apiKeyService.updateApiKey(selectedKey.id, { isHidden: false })
+    convertSpinner.succeed('转换成功')
+
+    console.log(styles.success(`\n✅ "${selectedKey.name}" 已转换为普通 Key`))
+  } catch (error) {
+    spinner.fail('转换失败')
+    console.error(styles.error(error.message))
+  }
+}
+
+// 删除隐身 Key
+async function deleteHiddenApiKey() {
+  const spinner = ora('正在获取隐身 API Keys...').start()
+
+  try {
+    const allKeys = await apiKeyService.getAllApiKeys()
+    const hiddenKeys = allKeys.filter((k) => k.isHidden === 'true')
+
+    spinner.stop()
+
+    if (hiddenKeys.length === 0) {
+      console.log(styles.warning('没有找到隐身 API Keys'))
+      return
+    }
+
+    const { selectedKey } = await inquirer.prompt([
+      {
+        type: 'list',
+        name: 'selectedKey',
+        message: '选择要删除的隐身 Key:',
+        choices: hiddenKeys.map((key) => ({
+          name: `${key.name} (${key.id.substring(0, 16)}...)`,
+          value: key
+        }))
+      }
+    ])
+
+    const { confirm } = await inquirer.prompt([
+      {
+        type: 'confirm',
+        name: 'confirm',
+        message: `确认删除 "${selectedKey.name}"？此操作为软删除，可恢复。`,
+        default: false
+      }
+    ])
+
+    if (!confirm) {
+      console.log(styles.info('已取消删除'))
+      return
+    }
+
+    const deleteSpinner = ora('正在删除...').start()
+    await apiKeyService.deleteApiKey(selectedKey.id, 'cli', 'admin')
+    deleteSpinner.succeed('删除成功')
+
+    console.log(styles.success(`\n✅ "${selectedKey.name}" 已删除`))
+  } catch (error) {
+    spinner.fail('删除失败')
+    console.error(styles.error(error.message))
+  }
+}
+
 // 程序信息
 program.name('claude-relay-cli').description('Claude Relay Service 命令行管理工具').version('1.0.0')
 
