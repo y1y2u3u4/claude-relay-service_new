@@ -23,13 +23,11 @@ async function ipWhitelistMiddleware(req, res, next) {
 
   // 如果白名单为空，记录警告并拒绝所有访问
   if (whitelist.length === 0) {
-    logger.warn(
-      `🚫 IP Whitelist enabled but no IPs configured. Blocking request from ${clientIp}`
-    )
+    logger.warn(`🚫 IP Whitelist enabled but no IPs configured. Blocking request from ${clientIp}`)
     return res.status(403).json({
       error: 'Forbidden',
       message: 'Access denied. IP address not whitelisted.',
-      clientIp: clientIp
+      clientIp
     })
   }
 
@@ -62,7 +60,7 @@ async function ipWhitelistMiddleware(req, res, next) {
   return res.status(403).json({
     error: 'Forbidden',
     message: 'Access denied. Your IP address is not whitelisted.',
-    clientIp: clientIp
+    clientIp
   })
 }
 

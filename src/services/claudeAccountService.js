@@ -2333,6 +2333,14 @@ class ClaudeAccountService {
         timestampField: 'blockedAt',
         errorCode: 'CLAUDE_OAUTH_BLOCKED',
         logMessage: 'blocked'
+      },
+      organization_disabled: {
+        status: 'organization_disabled',
+        errorMessage:
+          'Organization disabled (400 error - organization has been disabled by Anthropic)',
+        timestampField: 'organizationDisabledAt',
+        errorCode: 'CLAUDE_OAUTH_ORGANIZATION_DISABLED',
+        logMessage: 'organization_disabled'
       }
     }
 
@@ -2398,6 +2406,11 @@ class ClaudeAccountService {
   // 🚫 标记账户为被封锁状态（403错误）
   async markAccountBlocked(accountId, sessionHash = null) {
     return this.markAccountError(accountId, 'blocked', sessionHash)
+  }
+
+  // 🚫 标记账户为组织已禁用状态（400错误 - Organization Disabled）
+  async markAccountOrganizationDisabled(accountId, sessionHash = null) {
+    return this.markAccountError(accountId, 'organization_disabled', sessionHash)
   }
 
   // 🔄 重置账户所有异常状态

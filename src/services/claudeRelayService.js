@@ -138,6 +138,73 @@ class ClaudeRelayService {
     return message.toLowerCase().includes('this organization has been disabled')
   }
 
+  // 🔥 智能判断403错误是否为账号封禁（而非临时性错误）
+  _is403AccountBannedError(body) {
+    const message = this._extractErrorMessage(body)
+    if (!message) {
+      // 没有错误消息，无法判断，为了安全起见返回false（不触发熔断）
+      logger.debug('403 error with no error message, treating as non-ban error')
+      return false
+    }
+
+    const lowerMessage = message.toLowerCase()
+
+    // 🚫 明确的账号封禁关键词（应该触发熔断）
+    const banKeywords = [
+      'account suspended',
+      'account banned',
+      'account disabled',
+      'account has been suspended',
+      'account has been banned',
+      'account has been disabled',
+      'your account has been',
+      'access permanently denied',
+      'permanently blocked'
+    ]
+
+    // ✅ 非封禁类403错误关键词（不应该触发熔断）
+    const nonBanKeywords = [
+      'invalid api key',
+      'api key',
+      'authentication',
+      'missing',
+      'required',
+      'invalid request',
+      'bad request',
+      'malformed',
+      'parameter',
+      'header',
+      'content-type',
+      'permission_error' // Claude API的通用权限错误，通常不是账号封禁
+    ]
+
+    // 先检查是否是非封禁类错误
+    for (const keyword of nonBanKeywords) {
+      if (lowerMessage.includes(keyword)) {
+        logger.info(
+          `403 error identified as non-ban error (keyword: "${keyword}"): ${message.substring(0, 100)}`
+        )
+        return false
+      }
+    }
+
+    // 再检查是否是明确的封禁类错误
+    for (const keyword of banKeywords) {
+      if (lowerMessage.includes(keyword)) {
+        logger.warn(
+          `403 error identified as account ban error (keyword: "${keyword}"): ${message.substring(0, 100)}`
+        )
+        return true
+      }
+    }
+
+    // 默认情况：无法明确判断的403错误，不触发熔断（避免误判）
+    logger.info(
+      `403 error with ambiguous message, treating as non-ban error to avoid false positive: ${message.substring(0, 100)}`
+    )
+    return false
+  }
+
   // 🔍 判断是否是真实的 Claude Code 请求
   isRealClaudeCodeRequest(requestBody) {
     return ClaudeCodeValidator.includesClaudeCodeSystemPrompt(requestBody, 1)
@@ -413,10 +480,16 @@ class ClaudeRelayService {
       // 获取有效的访问token
       const accessToken = await claudeAccountService.getValidAccessToken(accountId)
 
-      // 🛡️ 同秒请求防护：确保同一账户不会在同一秒内发送多次请求
+      // 🛡️ 请求间隔防护：确保同一账户的请求满足间隔要求
       if (config.claude.sameSecondRequestGuard?.enabled !== false) {
         const maxWait = config.claude.sameSecondRequestGuard?.maxWaitMs || 1000
-        const guardResult = await sameSecondRequestGuard.checkAndWait(accountId, accountType, maxWait)
+        const minInterval = config.claude.sameSecondRequestGuard?.minIntervalMs || 0
+        const guardResult = await sameSecondRequestGuard.checkAndWait(
+          accountId,
+          accountType,
+          maxWait,
+          minInterval
+        )
         if (!guardResult.allowed) {
           logger.warn(
             `🚫 Same-second request rejected for account ${accountId} (${accountType}), wait time exceeded threshold`
@@ -536,39 +609,55 @@ class ClaudeRelayService {
             )
           }
         }
-        // 检查是否为403状态码（禁止访问 - 触发熔断机制）
+        // 检查是否为403状态码（禁止访问 - 智能判断是否触发熔断机制）
         else if (response.statusCode === 403) {
-          logger.warn(
-            `🚫 Forbidden error (403) detected for account ${accountId} - triggering circuit breaker`
-          )
+          // 🧠 智能判断：只有确认是账号封禁时才触发熔断
+          const isAccountBanned = this._is403AccountBannedError(response.body)
 
-          // 记录403错误并检查是否触发熔断
-          const breakerResult = await error403CircuitBreakerService.record403Error(accountId)
-
-          if (breakerResult.triggered) {
-            // 熔断器触发，标记账户为blocked
-            logger.error(
-              `🔥 Circuit breaker TRIGGERED for account ${accountId}, marking as blocked`,
-              {
-                errorCount: breakerResult.errorCount,
-                threshold: breakerResult.threshold
-              }
-            )
-            await unifiedClaudeScheduler.markAccountBlocked(accountId, accountType, sessionHash)
-          } else {
+          if (isAccountBanned) {
+            // 确认是账号封禁，记录403错误并检查是否触发熔断
             logger.warn(
-              `⚠️  Account ${accountId} has ${breakerResult.errorCount}/${breakerResult.threshold} 403 errors`,
-              {
-                errorCount: breakerResult.errorCount,
-                threshold: breakerResult.threshold
-              }
+              `🚫 Forbidden error (403) identified as ACCOUNT BAN for account ${accountId} - triggering circuit breaker`
+            )
+
+            const breakerResult = await error403CircuitBreakerService.record403Error(accountId)
+
+            if (breakerResult.triggered) {
+              // 熔断器触发，标记账户为blocked
+              logger.error(
+                `🔥 Circuit breaker TRIGGERED for account ${accountId}, marking as blocked`,
+                {
+                  errorCount: breakerResult.errorCount,
+                  threshold: breakerResult.threshold
+                }
+              )
+              await unifiedClaudeScheduler.markAccountBlocked(accountId, accountType, sessionHash)
+            } else {
+              logger.warn(
+                `⚠️  Account ${accountId} has ${breakerResult.errorCount}/${breakerResult.threshold} ban-type 403 errors`,
+                {
+                  errorCount: breakerResult.errorCount,
+                  threshold: breakerResult.threshold
+                }
+              )
+            }
+          } else {
+            // 非账号封禁类403错误，只记录日志，不触发熔断
+            logger.info(
+              `🔍 Forbidden error (403) detected for account ${accountId}, but identified as NON-BAN error (parameter/auth issue) - NOT triggering circuit breaker`
             )
           }
         }
-        // 检查是否返回组织被禁用错误（400状态码）- 只记录不标记
+        // 检查是否返回组织被禁用错误（400状态码）- 立即标记账号并清除会话
         else if (organizationDisabledError) {
           logger.error(
-            `🚫 Organization disabled error (400) detected for account ${accountId} - logging only, not marking account`
+            `🚫 Organization disabled error (400) detected for account ${accountId} - marking account as organization_disabled`
+          )
+          // 立即标记账号为 organization_disabled，并清除粘性会话
+          await unifiedClaudeScheduler.markAccountOrganizationDisabled(
+            accountId,
+            accountType,
+            sessionHash
           )
         }
         // 检查是否为529状态码（服务过载）- 只记录不标记
@@ -1735,10 +1824,16 @@ class ClaudeRelayService {
       // 获取有效的访问token
       const accessToken = await claudeAccountService.getValidAccessToken(accountId)
 
-      // 🛡️ 同秒请求防护：确保同一账户不会在同一秒内发送多次请求（流式）
+      // 🛡️ 请求间隔防护：确保同一账户的请求满足间隔要求（流式）
       if (config.claude.sameSecondRequestGuard?.enabled !== false) {
         const maxWait = config.claude.sameSecondRequestGuard?.maxWaitMs || 1000
-        const guardResult = await sameSecondRequestGuard.checkAndWait(accountId, accountType, maxWait)
+        const minInterval = config.claude.sameSecondRequestGuard?.minIntervalMs || 0
+        const guardResult = await sameSecondRequestGuard.checkAndWait(
+          accountId,
+          accountType,
+          maxWait,
+          minInterval
+        )
         if (!guardResult.allowed) {
           logger.warn(
             `🚫 [Stream] Same-second request rejected for account ${accountId} (${accountType}), wait time exceeded threshold`
@@ -1993,6 +2088,7 @@ class ClaudeRelayService {
           }
 
           // 将错误处理逻辑封装在一个异步函数中
+          // 注意：403错误的处理已移到 res.on('end') 中，以便获取 errorData 后再智能判断
           const handleErrorResponse = async () => {
             if (res.statusCode === 401) {
               logger.warn(`🔐 [Stream] Unauthorized error (401) detected for account ${accountId}`)
@@ -2014,34 +2110,6 @@ class ClaudeRelayService {
                   sessionHash
                 )
               }
-            } else if (res.statusCode === 403) {
-              // 403错误触发熔断机制
-              logger.warn(
-                `🚫 [Stream] Forbidden error (403) detected for account ${accountId} - triggering circuit breaker`
-              )
-
-              // 记录403错误并检查是否触发熔断
-              const breakerResult = await error403CircuitBreakerService.record403Error(accountId)
-
-              if (breakerResult.triggered) {
-                // 熔断器触发，标记账户为blocked
-                logger.error(
-                  `🔥 [Stream] Circuit breaker TRIGGERED for account ${accountId}, marking as blocked`,
-                  {
-                    errorCount: breakerResult.errorCount,
-                    threshold: breakerResult.threshold
-                  }
-                )
-                await unifiedClaudeScheduler.markAccountBlocked(accountId, accountType, sessionHash)
-              } else {
-                logger.warn(
-                  `⚠️  [Stream] Account ${accountId} has ${breakerResult.errorCount}/${breakerResult.threshold} 403 errors`,
-                  {
-                    errorCount: breakerResult.errorCount,
-                    threshold: breakerResult.threshold
-                  }
-                )
-              }
             } else if (res.statusCode === 529) {
               // 529是服务过载，只记录日志，不标记账号
               logger.warn(
@@ -2053,6 +2121,7 @@ class ClaudeRelayService {
                 `🔥 [Stream] Server error (${res.statusCode}) detected for account ${accountId} - temporary, not marking account`
               )
             }
+            // 403错误的处理已移到 res.on('end') 回调中
           }
 
           // 调用异步错误处理函数
@@ -2069,15 +2138,65 @@ class ClaudeRelayService {
             errorData += chunk.toString()
           })
 
-          res.on('end', () => {
+          res.on('end', async () => {
             logger.error(
               `❌ Claude API error response (Account: ${account?.name || accountId}):`,
               errorData
             )
+
+            // 🧠 智能判断403错误：只有确认是账号封禁时才触发熔断
+            if (res.statusCode === 403) {
+              const isAccountBanned = this._is403AccountBannedError(errorData)
+
+              if (isAccountBanned) {
+                // 确认是账号封禁，记录403错误并检查是否触发熔断
+                logger.warn(
+                  `🚫 [Stream] Forbidden error (403) identified as ACCOUNT BAN for account ${accountId} - triggering circuit breaker`
+                )
+
+                const breakerResult = await error403CircuitBreakerService.record403Error(accountId)
+
+                if (breakerResult.triggered) {
+                  // 熔断器触发，标记账户为blocked
+                  logger.error(
+                    `🔥 [Stream] Circuit breaker TRIGGERED for account ${accountId}, marking as blocked`,
+                    {
+                      errorCount: breakerResult.errorCount,
+                      threshold: breakerResult.threshold
+                    }
+                  )
+                  await unifiedClaudeScheduler.markAccountBlocked(
+                    accountId,
+                    accountType,
+                    sessionHash
+                  )
+                } else {
+                  logger.warn(
+                    `⚠️  [Stream] Account ${accountId} has ${breakerResult.errorCount}/${breakerResult.threshold} ban-type 403 errors`,
+                    {
+                      errorCount: breakerResult.errorCount,
+                      threshold: breakerResult.threshold
+                    }
+                  )
+                }
+              } else {
+                // 非账号封禁类403错误，只记录日志，不触发熔断
+                logger.info(
+                  `🔍 [Stream] Forbidden error (403) detected for account ${accountId}, but identified as NON-BAN error (parameter/auth issue) - NOT triggering circuit breaker`
+                )
+              }
+            }
+
             if (this._isOrganizationDisabledError(res.statusCode, errorData)) {
-              // 组织禁用错误，只记录日志，不标记账号
+              // 组织禁用错误，立即标记账号并清除会话
               logger.error(
-                `🚫 [Stream] Organization disabled error (400) detected for account ${accountId} - logging only, not marking account`
+                `🚫 [Stream] Organization disabled error (400) detected for account ${accountId} - marking account as organization_disabled`
+              )
+              // 立即标记账号为 organization_disabled，并清除粘性会话
+              await unifiedClaudeScheduler.markAccountOrganizationDisabled(
+                accountId,
+                accountType,
+                sessionHash
               )
             }
             if (!responseStream.destroyed) {

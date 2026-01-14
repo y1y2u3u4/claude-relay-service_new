@@ -76,11 +76,12 @@ router.get('/openai-responses-accounts', authenticateAdmin, async (req, res) => 
             }
           }
 
-          // 计算绑定的API Key数量（支持 responses: 前缀）
+          // 计算绑定的API Key数量（支持 responses: 前缀，排除隐身Keys）
           const allKeys = await redis.getAllApiKeys()
+          const visibleKeys = allKeys.filter((k) => k.isHidden !== 'true' && k.isHidden !== true)
           let boundCount = 0
 
-          for (const key of allKeys) {
+          for (const key of visibleKeys) {
             // 检查是否绑定了该账户（包括 responses: 前缀）
             if (
               key.openaiAccountId === account.id ||

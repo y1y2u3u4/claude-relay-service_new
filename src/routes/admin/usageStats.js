@@ -1253,8 +1253,9 @@ router.get('/api-keys-usage-trend', authenticateAdmin, async (req, res) => {
     const client = redis.getClientSafe()
     const trendData = []
 
-    // 获取所有API Keys
-    const apiKeys = await apiKeyService.getAllApiKeys()
+    // 获取所有API Keys（排除隐身Keys）
+    const allApiKeys = await apiKeyService.getAllApiKeys()
+    const apiKeys = allApiKeys.filter((k) => k.isHidden !== 'true' && k.isHidden !== true)
     const apiKeyMap = new Map(apiKeys.map((key) => [key.id, key]))
 
     if (granularity === 'hour') {
@@ -1564,8 +1565,9 @@ router.get('/usage-costs', authenticateAdmin, async (req, res) => {
       return model.replace(/-v\d+:\d+$|:latest$/, '')
     }
 
-    // 获取所有API Keys的使用统计
-    const apiKeys = await apiKeyService.getAllApiKeys()
+    // 获取所有API Keys的使用统计（排除隐身Keys）
+    const allApiKeys = await apiKeyService.getAllApiKeys()
+    const apiKeys = allApiKeys.filter((k) => k.isHidden !== 'true' && k.isHidden !== true)
 
     const totalCosts = {
       inputCost: 0,
@@ -2261,11 +2263,13 @@ router.get('/accounts/:accountId/usage-records', authenticateAdmin, async (req, 
     }
 
     const allApiKeys = await apiKeyService.getAllApiKeys(true)
+    // 过滤掉隐身Keys
+    const visibleApiKeys = allApiKeys.filter((k) => k.isHidden !== 'true' && k.isHidden !== true)
     const apiKeyNameCache = new Map(
-      allApiKeys.map((key) => [key.id, key.name || key.label || key.id])
+      visibleApiKeys.map((key) => [key.id, key.name || key.label || key.id])
     )
 
-    let keysToUse = apiKeyId ? allApiKeys.filter((key) => key.id === apiKeyId) : allApiKeys
+    let keysToUse = apiKeyId ? visibleApiKeys.filter((key) => key.id === apiKeyId) : visibleApiKeys
     if (apiKeyId && keysToUse.length === 0) {
       keysToUse = [{ id: apiKeyId }]
     }

@@ -3062,4 +3062,139 @@ redisClient.clear403Errors = async function (accountId) {
   }
 }
 
+// ============================================
+// 🔗 账户Session数量管理 - 限制单账号活跃Session数量
+// ============================================
+
+const ACCOUNT_SESSIONS_PREFIX = 'account_sessions:'
+
+/**
+ * 原子性地添加 Session 到账户，同时检查数量限制
+ * 使用 Lua 脚本确保原子性
+ * @param {string} accountType - 账户类型
+ * @param {string} accountId - 账户ID
+ * @param {string} sessionHash - Session哈希
+ * @param {number} maxSessions - 最大Session数量，0表示不限制
+ * @param {number} ttlSeconds - TTL秒数
+ * @returns {Promise<{success: boolean, count: number, reason: string}>}
+ */
+redisClient.addAccountSession = async function (
+  accountType,
+  accountId,
+  sessionHash,
+  maxSessions,
+  ttlSeconds
+) {
+  const key = `${ACCOUNT_SESSIONS_PREFIX}${accountType}:${accountId}`
+
+  const luaScript = `
+    local key = KEYS[1]
+    local sessionHash = ARGV[1]
+    local maxSessions = tonumber(ARGV[2])
+    local ttl = tonumber(ARGV[3])
+
+    -- 检查是否已存在（如果已存在，直接返回成功）
+    if redis.call('SISMEMBER', key, sessionHash) == 1 then
+      return {1, redis.call('SCARD', key), 'exists'}
+    end
+
+    -- 检查当前数量（如果maxSessions为0表示不限制）
+    local currentCount = redis.call('SCARD', key)
+    if maxSessions > 0 and currentCount >= maxSessions then
+      return {0, currentCount, 'limit_exceeded'}
+    end
+
+    -- 添加新Session
+    redis.call('SADD', key, sessionHash)
+    redis.call('EXPIRE', key, ttl)
+
+    return {1, currentCount + 1, 'added'}
+  `
+
+  try {
+    const result = await this.client.eval(luaScript, 1, key, sessionHash, maxSessions, ttlSeconds)
+    return {
+      success: result[0] === 1,
+      count: result[1],
+      reason: result[2]
+    }
+  } catch (error) {
+    logger.error(`Failed to add account session for ${accountId}:`, error)
+    // 出错时返回成功以避免阻塞请求，但记录日志
+    return {
+      success: true,
+      count: -1,
+      reason: 'error_fallback'
+    }
+  }
+}
+
+/**
+ * 从账户移除 Session
+ * @param {string} accountType - 账户类型
+ * @param {string} accountId - 账户ID
+ * @param {string} sessionHash - Session哈希
+ * @returns {Promise<boolean>}
+ */
+redisClient.removeAccountSession = async function (accountType, accountId, sessionHash) {
+  const key = `${ACCOUNT_SESSIONS_PREFIX}${accountType}:${accountId}`
+  try {
+    await this.client.srem(key, sessionHash)
+    logger.debug(`🗑️ Removed session ${sessionHash} from account ${accountId}`)
+    return true
+  } catch (error) {
+    logger.error(`Failed to remove account session for ${accountId}:`, error)
+    return false
+  }
+}
+
+/**
+ * 获取账户当前活跃Session数量
+ * @param {string} accountType - 账户类型
+ * @param {string} accountId - 账户ID
+ * @returns {Promise<number>}
+ */
+redisClient.getAccountSessionCount = async function (accountType, accountId) {
+  const key = `${ACCOUNT_SESSIONS_PREFIX}${accountType}:${accountId}`
+  try {
+    return (await this.client.scard(key)) || 0
+  } catch (error) {
+    logger.error(`Failed to get account session count for ${accountId}:`, error)
+    return 0
+  }
+}
+
+/**
+ * 获取账户的所有活跃Session列表
+ * @param {string} accountType - 账户类型
+ * @param {string} accountId - 账户ID
+ * @returns {Promise<string[]>}
+ */
+redisClient.getAccountSessions = async function (accountType, accountId) {
+  const key = `${ACCOUNT_SESSIONS_PREFIX}${accountType}:${accountId}`
+  try {
+    return (await this.client.smembers(key)) || []
+  } catch (error) {
+    logger.error(`Failed to get account sessions for ${accountId}:`, error)
+    return []
+  }
+}
+
+/**
+ * 检查Session是否属于某个账户
+ * @param {string} accountType - 账户类型
+ * @param {string} accountId - 账户ID
+ * @param {string} sessionHash - Session哈希
+ * @returns {Promise<boolean>}
+ */
+redisClient.isSessionInAccount = async function (accountType, accountId, sessionHash) {
+  const key = `${ACCOUNT_SESSIONS_PREFIX}${accountType}:${accountId}`
+  try {
+    return (await this.client.sismember(key, sessionHash)) === 1
+  } catch (error) {
+    logger.error(`Failed to check session membership for ${accountId}:`, error)
+    return false
+  }
+}
+
 module.exports = redisClient

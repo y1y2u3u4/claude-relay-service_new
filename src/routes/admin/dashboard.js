@@ -52,6 +52,9 @@ router.get('/dashboard', authenticateAdmin, async (req, res) => {
       redis.getRealtimeSystemMetrics()
     ])
 
+    // 过滤掉隐身 API Keys
+    const visibleApiKeys = apiKeys.filter((k) => k.isHidden !== 'true' && k.isHidden !== true)
+
     // 处理Bedrock账户数据
     const bedrockAccounts = bedrockAccountsResult.success ? bedrockAccountsResult.data : []
     const normalizeBoolean = (value) => value === true || value === 'true'
@@ -91,37 +94,37 @@ router.get('/dashboard', authenticateAdmin, async (req, res) => {
       isRateLimitedFlag(acc.rateLimitStatus)
     ).length
 
-    // 计算使用统计（统一使用allTokens）
-    const totalTokensUsed = apiKeys.reduce(
+    // 计算使用统计（统一使用allTokens，排除隐身Keys）
+    const totalTokensUsed = visibleApiKeys.reduce(
       (sum, key) => sum + (key.usage?.total?.allTokens || 0),
       0
     )
-    const totalRequestsUsed = apiKeys.reduce(
+    const totalRequestsUsed = visibleApiKeys.reduce(
       (sum, key) => sum + (key.usage?.total?.requests || 0),
       0
     )
-    const totalInputTokensUsed = apiKeys.reduce(
+    const totalInputTokensUsed = visibleApiKeys.reduce(
       (sum, key) => sum + (key.usage?.total?.inputTokens || 0),
       0
     )
-    const totalOutputTokensUsed = apiKeys.reduce(
+    const totalOutputTokensUsed = visibleApiKeys.reduce(
       (sum, key) => sum + (key.usage?.total?.outputTokens || 0),
       0
     )
-    const totalCacheCreateTokensUsed = apiKeys.reduce(
+    const totalCacheCreateTokensUsed = visibleApiKeys.reduce(
       (sum, key) => sum + (key.usage?.total?.cacheCreateTokens || 0),
       0
     )
-    const totalCacheReadTokensUsed = apiKeys.reduce(
+    const totalCacheReadTokensUsed = visibleApiKeys.reduce(
       (sum, key) => sum + (key.usage?.total?.cacheReadTokens || 0),
       0
     )
-    const totalAllTokensUsed = apiKeys.reduce(
+    const totalAllTokensUsed = visibleApiKeys.reduce(
       (sum, key) => sum + (key.usage?.total?.allTokens || 0),
       0
     )
 
-    const activeApiKeys = apiKeys.filter((key) => key.isActive).length
+    const activeApiKeys = visibleApiKeys.filter((key) => key.isActive).length
 
     // Claude账户统计 - 根据账户管理页面的判断逻辑
     const normalClaudeAccounts = claudeAccounts.filter(
@@ -311,7 +314,7 @@ router.get('/dashboard', authenticateAdmin, async (req, res) => {
 
     const dashboard = {
       overview: {
-        totalApiKeys: apiKeys.length,
+        totalApiKeys: visibleApiKeys.length,
         activeApiKeys,
         // 总账户统计（所有平台）
         totalAccounts:
@@ -481,10 +484,11 @@ router.get('/usage-stats', authenticateAdmin, async (req, res) => {
   try {
     const { period = 'daily' } = req.query // daily, monthly
 
-    // 获取基础API Key统计
+    // 获取基础API Key统计（排除隐身Keys）
     const apiKeys = await apiKeyService.getAllApiKeys()
+    const visibleApiKeys = apiKeys.filter((k) => k.isHidden !== 'true' && k.isHidden !== true)
 
-    const stats = apiKeys.map((key) => ({
+    const stats = visibleApiKeys.map((key) => ({
       keyId: key.id,
       keyName: key.name,
       usage: key.usage

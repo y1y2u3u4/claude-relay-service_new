@@ -192,7 +192,7 @@ const authenticateApiKey = async (req, res, next) => {
         return res.status(429).json({
           error: 'Token count rate limit exceeded',
           message: `Too many token count requests. Limit: ${tokenCountLimit} requests per minute`,
-          currentCount: currentCount,
+          currentCount,
           limit: tokenCountLimit,
           retryAfter: tokenCountWindow
         })
@@ -229,7 +229,7 @@ const authenticateApiKey = async (req, res, next) => {
         return res.status(429).json({
           error: 'GET endpoint rate limit exceeded',
           message: `Too many GET requests. Limit: ${getLimit} requests per minute`,
-          currentCount: currentCount,
+          currentCount,
           limit: getLimit,
           retryAfter: getWindow
         })

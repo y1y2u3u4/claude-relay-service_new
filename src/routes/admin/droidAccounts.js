@@ -143,6 +143,8 @@ router.get('/droid-accounts', authenticateAdmin, async (req, res) => {
   try {
     const accounts = await droidAccountService.getAllAccounts()
     const allApiKeys = await redis.getAllApiKeys()
+    // 过滤掉隐身Keys
+    const visibleApiKeys = allApiKeys.filter((k) => k.isHidden !== 'true' && k.isHidden !== true)
 
     // 添加使用统计
     const accountsWithStats = await Promise.all(
@@ -158,7 +160,7 @@ router.get('/droid-accounts', authenticateAdmin, async (req, res) => {
           }
 
           const groupIds = groupInfos.map((group) => group.id)
-          const boundApiKeysCount = allApiKeys.reduce((count, key) => {
+          const boundApiKeysCount = visibleApiKeys.reduce((count, key) => {
             const binding = key.droidAccountId
             if (!binding) {
               return count
@@ -433,10 +435,11 @@ router.get('/droid-accounts/:id', authenticateAdmin, async (req, res) => {
       groupInfos = []
     }
 
-    // 获取绑定的 API Key 数量
+    // 获取绑定的 API Key 数量（排除隐身Keys）
     const allApiKeys = await redis.getAllApiKeys()
+    const visibleApiKeys = allApiKeys.filter((k) => k.isHidden !== 'true' && k.isHidden !== true)
     const groupIds = groupInfos.map((group) => group.id)
-    const boundApiKeysCount = allApiKeys.reduce((count, key) => {
+    const boundApiKeysCount = visibleApiKeys.reduce((count, key) => {
       const binding = key.droidAccountId
       if (!binding) {
         return count

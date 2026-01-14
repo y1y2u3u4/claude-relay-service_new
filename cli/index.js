@@ -1396,7 +1396,7 @@ async function listHiddenApiKeys() {
 
       tableData.push([
         key.name,
-        key.id.substring(0, 16) + '...',
+        `${key.id.substring(0, 16)}...`,
         key.isActive ? '🟢 活跃' : '🔴 停用',
         key.permissions || 'all',
         new Date(key.createdAt).toLocaleDateString(),

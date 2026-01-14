@@ -217,9 +217,7 @@ async function resolveClientIP(req) {
   if (isPrivateIP(originalIP)) {
     logger.debug(`🏠 Detected private IP: ${originalIP}, fetching server public IP...`)
     const publicIP = await getServerPublicIP()
-    logger.info(
-      `🔄 Resolved private IP ${originalIP} to server public IP: ${publicIP}`
-    )
+    logger.info(`🔄 Resolved private IP ${originalIP} to server public IP: ${publicIP}`)
     return publicIP
   }
 

@@ -372,7 +372,7 @@ async function getApiKeysSortedByCostPrecomputed(options) {
   const keyMap = new Map(allKeys.map((k) => [k.id, k]))
   let orderedKeys = rankedKeyIds
     .map((id) => keyMap.get(id))
-    .filter((k) => k && !k.isDeleted && k.isHidden !== 'true') // 排除已删除和隐身的 Key
+    .filter((k) => k && !k.isDeleted && k.isHidden !== 'true' && k.isHidden !== true) // 排除已删除和隐身的 Key
 
   // 4. 应用筛选条件
   // 状态筛选
@@ -489,7 +489,7 @@ async function getApiKeysSortedByCostCustom(options) {
   const keyMap = new Map(allKeys.map((k) => [k.id, k]))
   let orderedKeys = rankedKeyIds
     .map((id) => keyMap.get(id))
-    .filter((k) => k && !k.isDeleted && k.isHidden !== 'true') // 排除已删除和隐身的 Key
+    .filter((k) => k && !k.isDeleted && k.isHidden !== 'true' && k.isHidden !== true) // 排除已删除和隐身的 Key
 
   // 5. 应用筛选条件
   // 状态筛选

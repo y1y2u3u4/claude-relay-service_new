@@ -449,19 +449,68 @@ class UnifiedClaudeScheduler {
       // 按优先级和最后使用时间排序
       const sortedAccounts = this._sortAccountsByPriority(availableAccounts)
 
-      // 选择第一个账户
-      const selectedAccount = sortedAccounts[0]
+      // 获取重试配置
+      const appConfig = require('../../config/config')
+      const retryConfig = appConfig.session?.sessionLimitRetry || {}
+      const retryEnabled = retryConfig.enabled !== false
+      const waitIntervalMs = retryConfig.waitIntervalMs || 5000
+      const maxWaitTimeMs = retryConfig.maxWaitTimeMs || 180000 // 默认3分钟
 
-      // 如果有会话哈希，建立新的映射
-      if (sessionHash) {
-        await this._setSessionMapping(
-          sessionHash,
-          selectedAccount.accountId,
-          selectedAccount.accountType
-        )
-        logger.info(
-          `🎯 Created new sticky session mapping: ${selectedAccount.name} (${selectedAccount.accountId}, ${selectedAccount.accountType}) for session ${sessionHash}`
-        )
+      let selectedAccount = null
+      let sessionLimitExceededAccounts = []
+      const startTime = Date.now()
+      let retryCount = 0
+
+      // 带排队等待的账户选择循环
+      while (!selectedAccount) {
+        sessionLimitExceededAccounts = []
+
+        for (const account of sortedAccounts) {
+          // 如果有会话哈希，需要检查Session数量限制
+          if (sessionHash) {
+            try {
+              await this._setSessionMapping(sessionHash, account.accountId, account.accountType)
+              selectedAccount = account
+              logger.info(
+                `🎯 Created new sticky session mapping: ${account.name} (${account.accountId}, ${account.accountType}) for session ${sessionHash}`
+              )
+              break // 成功创建映射，使用这个账户
+            } catch (error) {
+              if (error.code === 'SESSION_LIMIT_EXCEEDED') {
+                // Session数量已满，记录并尝试下一个账户
+                sessionLimitExceededAccounts.push(account.name || account.accountId)
+                logger.info(
+                  `⏭️ Account ${account.name} (${account.accountId}) session limit exceeded, trying next account...`
+                )
+                continue
+              }
+              // 其他错误直接抛出
+              throw error
+            }
+          } else {
+            // 没有会话哈希，直接选择第一个账户
+            selectedAccount = account
+            break
+          }
+        }
+
+        // 如果所有账户都满了，进入排队等待
+        if (!selectedAccount) {
+          const elapsedMs = Date.now() - startTime
+          // 检查是否超时（maxWaitTimeMs为0表示无限等待）
+          if (!retryEnabled || (maxWaitTimeMs > 0 && elapsedMs >= maxWaitTimeMs)) {
+            const errorMsg = `All available accounts have reached session limit after ${Math.round(elapsedMs / 1000)}s waiting (tried: ${sessionLimitExceededAccounts.join(', ')})`
+            logger.error(`🚫 ${errorMsg}`)
+            throw new Error(errorMsg)
+          }
+
+          retryCount++
+          const remainingMs = maxWaitTimeMs > 0 ? Math.max(0, maxWaitTimeMs - elapsedMs) : '∞'
+          logger.info(
+            `⏳ All accounts session limit exceeded, queuing... waited ${Math.round(elapsedMs / 1000)}s, remaining ${typeof remainingMs === 'number' ? Math.round(remainingMs / 1000) + 's' : remainingMs} (retry #${retryCount})`
+          )
+          await new Promise((resolve) => setTimeout(resolve, waitIntervalMs))
+        }
       }
 
       logger.info(
@@ -1206,21 +1255,71 @@ class UnifiedClaudeScheduler {
     return null
   }
 
-  // 💾 设置会话映射
+  // 💾 设置会话映射（支持Session数量限制）
   async _setSessionMapping(sessionHash, accountId, accountType) {
     const client = redis.getClientSafe()
-    const mappingData = JSON.stringify({ accountId, accountType })
-    // 依据配置设置TTL（小时）
     const appConfig = require('../../config/config')
     const ttlHours = appConfig.session?.stickyTtlHours || 1
     const ttlSeconds = Math.max(1, Math.floor(ttlHours * 60 * 60))
+    const maxSessions = appConfig.session?.maxSessionsPerAccount || 10
+
+    // 1. 先检查并添加到账户Session集合（原子操作）
+    const addResult = await redis.addAccountSession(
+      accountType,
+      accountId,
+      sessionHash,
+      maxSessions,
+      ttlSeconds
+    )
+
+    if (!addResult.success) {
+      if (addResult.reason === 'limit_exceeded') {
+        logger.warn(
+          `🚫 Account ${accountId} (${accountType}) has reached max sessions limit (${maxSessions}), ` +
+            `current count: ${addResult.count}, session ${sessionHash} rejected`
+        )
+        // 抛出特定错误，让调用方处理
+        const error = new Error('Account session limit exceeded')
+        error.code = 'SESSION_LIMIT_EXCEEDED'
+        error.accountId = accountId
+        error.accountType = accountType
+        error.currentCount = addResult.count
+        error.maxSessions = maxSessions
+        throw error
+      }
+    }
+
+    // 2. 设置Session映射（原有逻辑）
+    const mappingData = JSON.stringify({ accountId, accountType })
     await client.setex(`${this.SESSION_MAPPING_PREFIX}${sessionHash}`, ttlSeconds, mappingData)
+
+    if (addResult.reason !== 'exists') {
+      logger.debug(
+        `💾 Session mapping created: ${sessionHash} -> ${accountId} (${accountType}), ` +
+          `account sessions: ${addResult.count}/${maxSessions}`
+      )
+    }
   }
 
-  // 🗑️ 删除会话映射
+  // 🗑️ 删除会话映射（同时从账户Session集合中移除）
   async _deleteSessionMapping(sessionHash) {
     const client = redis.getClientSafe()
-    await client.del(`${this.SESSION_MAPPING_PREFIX}${sessionHash}`)
+    const key = `${this.SESSION_MAPPING_PREFIX}${sessionHash}`
+
+    // 1. 先获取映射信息，以便知道要从哪个账户移除
+    const mappingData = await client.get(key)
+    if (mappingData) {
+      try {
+        const { accountId, accountType } = JSON.parse(mappingData)
+        // 2. 从账户Session集合中移除
+        await redis.removeAccountSession(accountType, accountId, sessionHash)
+      } catch (error) {
+        logger.warn('⚠️ Failed to parse session mapping for cleanup:', error)
+      }
+    }
+
+    // 3. 删除映射
+    await client.del(key)
   }
 
   /**
@@ -1518,6 +1617,37 @@ class UnifiedClaudeScheduler {
     }
   }
 
+  // 🚫 标记账户为组织已禁用状态（400错误 - Organization Disabled by Anthropic）
+  async markAccountOrganizationDisabled(accountId, accountType, sessionHash = null) {
+    try {
+      // 只处理claude-official类型的账户
+      if (accountType === 'claude-official') {
+        await claudeAccountService.markAccountOrganizationDisabled(accountId, sessionHash)
+
+        // 删除会话映射
+        if (sessionHash) {
+          await this._deleteSessionMapping(sessionHash)
+        }
+
+        logger.error(
+          `🚫 Account ${accountId} marked as organization_disabled - organization has been disabled by Anthropic`
+        )
+      } else {
+        logger.info(
+          `ℹ️ Skipping organization_disabled marking for non-Claude OAuth account: ${accountId} (${accountType})`
+        )
+      }
+
+      return { success: true }
+    } catch (error) {
+      logger.error(
+        `❌ Failed to mark account as organization_disabled: ${accountId} (${accountType})`,
+        error
+      )
+      throw error
+    }
+  }
+
   // 🚫 标记Claude Console账户为封锁状态（模型不支持）
   async blockConsoleAccount(accountId, reason) {
     try {
@@ -1693,19 +1823,63 @@ class UnifiedClaudeScheduler {
       // 使用现有的优先级排序逻辑
       const sortedAccounts = this._sortAccountsByPriority(availableAccounts)
 
-      // 选择第一个账户
-      const selectedAccount = sortedAccounts[0]
+      // 获取重试配置
+      const appConfig = require('../../config/config')
+      const retryConfig = appConfig.session?.sessionLimitRetry || {}
+      const retryEnabled = retryConfig.enabled !== false
+      const waitIntervalMs = retryConfig.waitIntervalMs || 5000
+      const maxWaitTimeMs = retryConfig.maxWaitTimeMs || 180000
 
-      // 如果有会话哈希，建立新的映射
-      if (sessionHash) {
-        await this._setSessionMapping(
-          sessionHash,
-          selectedAccount.accountId,
-          selectedAccount.accountType
-        )
-        logger.info(
-          `🎯 Created new sticky session mapping in group: ${selectedAccount.name} (${selectedAccount.accountId}, ${selectedAccount.accountType}) for session ${sessionHash}`
-        )
+      let selectedAccount = null
+      let sessionLimitExceededAccounts = []
+      const startTime = Date.now()
+      let retryCount = 0
+
+      // 带排队等待的账户选择循环
+      while (!selectedAccount) {
+        sessionLimitExceededAccounts = []
+
+        for (const account of sortedAccounts) {
+          if (sessionHash) {
+            try {
+              await this._setSessionMapping(sessionHash, account.accountId, account.accountType)
+              selectedAccount = account
+              logger.info(
+                `🎯 Created new sticky session mapping in group: ${account.name} (${account.accountId}, ${account.accountType}) for session ${sessionHash}`
+              )
+              break
+            } catch (error) {
+              if (error.code === 'SESSION_LIMIT_EXCEEDED') {
+                sessionLimitExceededAccounts.push(account.name || account.accountId)
+                logger.info(
+                  `⏭️ Account ${account.name} (${account.accountId}) in group session limit exceeded, trying next...`
+                )
+                continue
+              }
+              throw error
+            }
+          } else {
+            selectedAccount = account
+            break
+          }
+        }
+
+        // 如果所有账户都满了，进入排队等待
+        if (!selectedAccount) {
+          const elapsedMs = Date.now() - startTime
+          if (!retryEnabled || (maxWaitTimeMs > 0 && elapsedMs >= maxWaitTimeMs)) {
+            throw new Error(
+              `All accounts in group ${group.name} have reached session limit after ${Math.round(elapsedMs / 1000)}s waiting (tried: ${sessionLimitExceededAccounts.join(', ')})`
+            )
+          }
+
+          retryCount++
+          const remainingMs = maxWaitTimeMs > 0 ? Math.max(0, maxWaitTimeMs - elapsedMs) : '∞'
+          logger.info(
+            `⏳ All accounts in group ${group.name} session limit exceeded, queuing... waited ${Math.round(elapsedMs / 1000)}s, remaining ${typeof remainingMs === 'number' ? Math.round(remainingMs / 1000) + 's' : remainingMs} (retry #${retryCount})`
+          )
+          await new Promise((resolve) => setTimeout(resolve, waitIntervalMs))
+        }
       }
 
       logger.info(
@@ -1762,18 +1936,64 @@ class UnifiedClaudeScheduler {
 
       // 3. 按优先级和最后使用时间排序
       const sortedAccounts = this._sortAccountsByPriority(availableCcrAccounts)
-      const selectedAccount = sortedAccounts[0]
 
-      // 4. 建立会话映射
-      if (sessionHash) {
-        await this._setSessionMapping(
-          sessionHash,
-          selectedAccount.accountId,
-          selectedAccount.accountType
-        )
-        logger.info(
-          `🎯 Created new sticky CCR session mapping: ${selectedAccount.name} (${selectedAccount.accountId}) for session ${sessionHash}`
-        )
+      // 获取重试配置
+      const appConfig = require('../../config/config')
+      const retryConfig = appConfig.session?.sessionLimitRetry || {}
+      const retryEnabled = retryConfig.enabled !== false
+      const waitIntervalMs = retryConfig.waitIntervalMs || 5000
+      const maxWaitTimeMs = retryConfig.maxWaitTimeMs || 180000
+
+      let selectedAccount = null
+      let sessionLimitExceededAccounts = []
+      const startTime = Date.now()
+      let retryCount = 0
+
+      // 带排队等待的账户选择循环
+      while (!selectedAccount) {
+        sessionLimitExceededAccounts = []
+
+        for (const account of sortedAccounts) {
+          if (sessionHash) {
+            try {
+              await this._setSessionMapping(sessionHash, account.accountId, account.accountType)
+              selectedAccount = account
+              logger.info(
+                `🎯 Created new sticky CCR session mapping: ${account.name} (${account.accountId}) for session ${sessionHash}`
+              )
+              break
+            } catch (error) {
+              if (error.code === 'SESSION_LIMIT_EXCEEDED') {
+                sessionLimitExceededAccounts.push(account.name || account.accountId)
+                logger.info(
+                  `⏭️ CCR Account ${account.name} (${account.accountId}) session limit exceeded, trying next...`
+                )
+                continue
+              }
+              throw error
+            }
+          } else {
+            selectedAccount = account
+            break
+          }
+        }
+
+        // 如果所有账户都满了，进入排队等待
+        if (!selectedAccount) {
+          const elapsedMs = Date.now() - startTime
+          if (!retryEnabled || (maxWaitTimeMs > 0 && elapsedMs >= maxWaitTimeMs)) {
+            throw new Error(
+              `All CCR accounts have reached session limit after ${Math.round(elapsedMs / 1000)}s waiting (tried: ${sessionLimitExceededAccounts.join(', ')})`
+            )
+          }
+
+          retryCount++
+          const remainingMs = maxWaitTimeMs > 0 ? Math.max(0, maxWaitTimeMs - elapsedMs) : '∞'
+          logger.info(
+            `⏳ All CCR accounts session limit exceeded, queuing... waited ${Math.round(elapsedMs / 1000)}s, remaining ${typeof remainingMs === 'number' ? Math.round(remainingMs / 1000) + 's' : remainingMs} (retry #${retryCount})`
+          )
+          await new Promise((resolve) => setTimeout(resolve, waitIntervalMs))
+        }
       }
 
       logger.info(
