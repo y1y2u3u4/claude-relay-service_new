@@ -96,56 +96,11 @@ Claude Relay Service 是一个多平台 AI API 中转服务，支持 **Claude (�
 - **代理支持**: OAuth授权和token交换全程支持代理配置
 - **安全存储**: claudeAiOauth数据加密存储，包含accessToken、refreshToken、scopes
 
-## 新增功能概览（相比旧版本）
-
-### 多平台支持
-
-- ✅ **Claude Console账户**: 支持Claude Console类型账户
-- ✅ **AWS Bedrock**: 完整的AWS Bedrock API支持
-- ✅ **Azure OpenAI**: Azure OpenAI服务支持
-- ✅ **Droid (Factory.ai)**: Factory.ai API支持
-- ✅ **CCR账户**: CCR凭据支持
-- ✅ **OpenAI兼容**: OpenAI格式转换和Responses格式支持
-
-### 用户和权限系统
-
-- ✅ **用户管理**: 完整的用户注册、登录、API Key管理系统
-- ✅ **LDAP认证**: 企业级LDAP/Active Directory集成
-- ✅ **权限控制**: API Key级别的服务权限（all/claude/gemini/openai）
-- ✅ **客户端限制**: 基于User-Agent的客户端识别和限制
-- ✅ **模型黑名单**: API Key级别的模型访问控制
-
-### 统一调度和会话管理
-
-- ✅ **统一调度器**: 跨账户类型的智能调度系统
-- ✅ **粘性会话**: 会话级账户绑定，支持自动续期
-- ✅ **并发控制**: Redis Sorted Set实现的并发限制
-- ✅ **负载均衡**: 自动账户选择和故障转移
-
-### 成本和监控
-
-- ✅ **定价服务**: 模型价格管理和自动成本计算
-- ✅ **成本统计**: 详细的token使用和费用统计
-- ✅ **缓存监控**: 全局缓存统计和命中率分析
-- ✅ **实时指标**: 可配置窗口的实时统计（METRICS_WINDOW）
-
-### Webhook和通知
-
-- ✅ **Webhook系统**: 事件通知和Webhook配置管理
-- ✅ **多URL支持**: 支持多个Webhook URL（逗号分隔）
-
-### 高级功能
-
-- ✅ **529错误处理**: 自动识别Claude过载状态并暂时排除账户
-- ✅ **HTTP调试**: DEBUG_HTTP_TRAFFIC模式详细记录HTTP请求/响应
-- ✅ **数据迁移**: 完整的数据导入导出工具（含加密/脱敏）
-- ✅ **自动清理**: 并发计数、速率限制、临时错误状态自动清理
-
 ## 常用命令
 
 ### 基本开发命令
 
-````bash
+```bash
 # 安装依赖和初始化
 npm install
 npm run setup                  # 生成配置和管理员凭据
@@ -166,6 +121,7 @@ npm run service:start:daemon  # 后台启动（推荐）
 npm run service:status        # 查看服务状态
 npm run service:logs          # 查看日志
 npm run service:stop          # 停止服务
+```
 
 ### 开发环境配置
 
@@ -186,6 +142,8 @@ npm run service:stop          # 停止服务
 - `CLAUDE_OVERLOAD_HANDLING_MINUTES`: Claude 529错误处理持续时间（分钟，0表示禁用）
 - `STICKY_SESSION_TTL_HOURS`: 粘性会话TTL（小时，默认1）
 - `STICKY_SESSION_RENEWAL_THRESHOLD_MINUTES`: 粘性会话续期阈值（分钟，默认0）
+- `SESSION_INACTIVE_TIMEOUT_SECONDS`: Session不活跃超时时间（秒，默认120），超时未活动的session自动释放槽位
+- `MAX_SESSIONS_PER_ACCOUNT`: 单账号最大活跃Session数量（默认10，0表示不限制）
 - `USER_MESSAGE_QUEUE_ENABLED`: 启用用户消息串行队列（默认true）
 - `USER_MESSAGE_QUEUE_DELAY_MS`: 用户消息请求间隔（毫秒，默认200）
 - `USER_MESSAGE_QUEUE_TIMEOUT_MS`: 队列等待超时（毫秒，默认30000）
@@ -501,8 +459,8 @@ npm run setup  # 自动生成密钥并创建管理员账户
   - `admin_credentials` - 管理员凭据（从data/init.json同步）
 - **会话管理**:
   - `session:{token}` - JWT会话管理
-  - `sticky_session:{sessionHash}` - 粘性会话账户绑定
-  - `session_window:{accountId}` - 账户会话窗口
+  - `unified_claude_session_mapping:{sessionHash}` - 统一会话到账户的映射
+  - `account_sessions:{accountType}:{accountId}` - ZSET，score为最后活跃时间戳（毫秒），支持不活跃自动过期
 - **使用统计**:
   - `usage:daily:{date}:{key}:{model}` - 按日期、Key、模型的使用统计
   - `usage:account:{accountId}:{date}` - 按账户的使用统计
@@ -583,10 +541,9 @@ npm run test:pricing-fallback  # 测试价格回退
 npm run monitor  # 增强监控脚本
 ```
 
-# important-instruction-reminders
+## Important Instruction Reminders
 
-Do what has been asked; nothing more, nothing less.
-NEVER create files unless they're absolutely necessary for achieving your goal.
-ALWAYS prefer editing an existing file to creating a new one.
-NEVER proactively create documentation files (\*.md) or README files. Only create documentation files if explicitly requested by the User.
-````
+- Do what has been asked; nothing more, nothing less.
+- NEVER create files unless they're absolutely necessary for achieving your goal.
+- ALWAYS prefer editing an existing file to creating a new one.
+- NEVER proactively create documentation files (*.md) or README files. Only create documentation files if explicitly requested by the User.

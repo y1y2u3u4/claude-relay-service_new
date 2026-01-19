@@ -3064,18 +3064,32 @@ redisClient.clear403Errors = async function (accountId) {
 
 // ============================================
 // 🔗 账户Session数量管理 - 限制单账号活跃Session数量
+// 使用 ZSET 实现，score 为最后活跃时间戳，支持不活跃自动过期
 // ============================================
 
 const ACCOUNT_SESSIONS_PREFIX = 'account_sessions:'
 
 /**
+ * 获取session不活跃超时时间（秒）
+ * @returns {number}
+ */
+function getSessionInactiveTimeout() {
+  try {
+    const appConfig = require('../../config/config')
+    return appConfig.session?.sessionInactiveTimeoutSeconds || 120
+  } catch {
+    return 120 // 默认2分钟
+  }
+}
+
+/**
  * 原子性地添加 Session 到账户，同时检查数量限制
- * 使用 Lua 脚本确保原子性
+ * 使用 Lua 脚本确保原子性，基于 ZSET 实现不活跃自动过期
  * @param {string} accountType - 账户类型
  * @param {string} accountId - 账户ID
  * @param {string} sessionHash - Session哈希
  * @param {number} maxSessions - 最大Session数量，0表示不限制
- * @param {number} ttlSeconds - TTL秒数
+ * @param {number} inactiveTimeoutSeconds - 不活跃超时时间（秒），可选，默认从配置读取
  * @returns {Promise<{success: boolean, count: number, reason: string}>}
  */
 redisClient.addAccountSession = async function (
@@ -3083,36 +3097,53 @@ redisClient.addAccountSession = async function (
   accountId,
   sessionHash,
   maxSessions,
-  ttlSeconds
+  inactiveTimeoutSeconds
 ) {
   const key = `${ACCOUNT_SESSIONS_PREFIX}${accountType}:${accountId}`
+  const timeout = inactiveTimeoutSeconds || getSessionInactiveTimeout()
+  const now = Date.now()
+  const expireThreshold = now - timeout * 1000
 
   const luaScript = `
     local key = KEYS[1]
     local sessionHash = ARGV[1]
     local maxSessions = tonumber(ARGV[2])
-    local ttl = tonumber(ARGV[3])
+    local now = tonumber(ARGV[3])
+    local expireThreshold = tonumber(ARGV[4])
 
-    -- 检查是否已存在（如果已存在，直接返回成功）
-    if redis.call('SISMEMBER', key, sessionHash) == 1 then
-      return {1, redis.call('SCARD', key), 'exists'}
+    -- 1. 先清理过期的session（score < expireThreshold 的都是不活跃的）
+    redis.call('ZREMRANGEBYSCORE', key, '-inf', expireThreshold)
+
+    -- 2. 检查是否已存在
+    local existingScore = redis.call('ZSCORE', key, sessionHash)
+    if existingScore then
+      -- 已存在，刷新活跃时间
+      redis.call('ZADD', key, now, sessionHash)
+      return {1, redis.call('ZCARD', key), 'exists'}
     end
 
-    -- 检查当前数量（如果maxSessions为0表示不限制）
-    local currentCount = redis.call('SCARD', key)
+    -- 3. 检查当前数量（如果maxSessions为0表示不限制）
+    local currentCount = redis.call('ZCARD', key)
     if maxSessions > 0 and currentCount >= maxSessions then
       return {0, currentCount, 'limit_exceeded'}
     end
 
-    -- 添加新Session
-    redis.call('SADD', key, sessionHash)
-    redis.call('EXPIRE', key, ttl)
+    -- 4. 添加新Session，score为当前时间戳
+    redis.call('ZADD', key, now, sessionHash)
 
     return {1, currentCount + 1, 'added'}
   `
 
   try {
-    const result = await this.client.eval(luaScript, 1, key, sessionHash, maxSessions, ttlSeconds)
+    const result = await this.client.eval(
+      luaScript,
+      1,
+      key,
+      sessionHash,
+      maxSessions,
+      now,
+      expireThreshold
+    )
     return {
       success: result[0] === 1,
       count: result[1],
@@ -3130,6 +3161,28 @@ redisClient.addAccountSession = async function (
 }
 
 /**
+ * 刷新 Session 的活跃时间（用于已绑定的session继续使用时）
+ * @param {string} accountType - 账户类型
+ * @param {string} accountId - 账户ID
+ * @param {string} sessionHash - Session哈希
+ * @returns {Promise<boolean>}
+ */
+redisClient.refreshAccountSession = async function (accountType, accountId, sessionHash) {
+  const key = `${ACCOUNT_SESSIONS_PREFIX}${accountType}:${accountId}`
+  const now = Date.now()
+  try {
+    // ZADD XX: 只更新已存在的成员，不添加新成员
+    const result = await this.client.zadd(key, 'XX', now, sessionHash)
+    // result = 0 表示更新了已存在的成员，result = 1 表示添加了新成员（但XX模式下不会添加）
+    logger.debug(`🔄 Refreshed session ${sessionHash.substring(0, 8)}... activity for account ${accountId}`)
+    return true
+  } catch (error) {
+    logger.error(`Failed to refresh account session for ${accountId}:`, error)
+    return false
+  }
+}
+
+/**
  * 从账户移除 Session
  * @param {string} accountType - 账户类型
  * @param {string} accountId - 账户ID
@@ -3139,7 +3192,7 @@ redisClient.addAccountSession = async function (
 redisClient.removeAccountSession = async function (accountType, accountId, sessionHash) {
   const key = `${ACCOUNT_SESSIONS_PREFIX}${accountType}:${accountId}`
   try {
-    await this.client.srem(key, sessionHash)
+    await this.client.zrem(key, sessionHash)
     logger.debug(`🗑️ Removed session ${sessionHash} from account ${accountId}`)
     return true
   } catch (error) {
@@ -3149,15 +3202,19 @@ redisClient.removeAccountSession = async function (accountType, accountId, sessi
 }
 
 /**
- * 获取账户当前活跃Session数量
+ * 获取账户当前活跃Session数量（自动清理过期的）
  * @param {string} accountType - 账户类型
  * @param {string} accountId - 账户ID
  * @returns {Promise<number>}
  */
 redisClient.getAccountSessionCount = async function (accountType, accountId) {
   const key = `${ACCOUNT_SESSIONS_PREFIX}${accountType}:${accountId}`
+  const timeout = getSessionInactiveTimeout()
+  const expireThreshold = Date.now() - timeout * 1000
   try {
-    return (await this.client.scard(key)) || 0
+    // 先清理过期的
+    await this.client.zremrangebyscore(key, '-inf', expireThreshold)
+    return (await this.client.zcard(key)) || 0
   } catch (error) {
     logger.error(`Failed to get account session count for ${accountId}:`, error)
     return 0
@@ -3165,15 +3222,20 @@ redisClient.getAccountSessionCount = async function (accountType, accountId) {
 }
 
 /**
- * 获取账户的所有活跃Session列表
+ * 获取账户的所有活跃Session列表（自动清理过期的）
  * @param {string} accountType - 账户类型
  * @param {string} accountId - 账户ID
  * @returns {Promise<string[]>}
  */
 redisClient.getAccountSessions = async function (accountType, accountId) {
   const key = `${ACCOUNT_SESSIONS_PREFIX}${accountType}:${accountId}`
+  const timeout = getSessionInactiveTimeout()
+  const expireThreshold = Date.now() - timeout * 1000
   try {
-    return (await this.client.smembers(key)) || []
+    // 先清理过期的
+    await this.client.zremrangebyscore(key, '-inf', expireThreshold)
+    // 获取所有成员（不带score）
+    return (await this.client.zrange(key, 0, -1)) || []
   } catch (error) {
     logger.error(`Failed to get account sessions for ${accountId}:`, error)
     return []
@@ -3181,7 +3243,7 @@ redisClient.getAccountSessions = async function (accountType, accountId) {
 }
 
 /**
- * 检查Session是否属于某个账户
+ * 检查Session是否属于某个账户（且未过期）
  * @param {string} accountType - 账户类型
  * @param {string} accountId - 账户ID
  * @param {string} sessionHash - Session哈希
@@ -3189,8 +3251,12 @@ redisClient.getAccountSessions = async function (accountType, accountId) {
  */
 redisClient.isSessionInAccount = async function (accountType, accountId, sessionHash) {
   const key = `${ACCOUNT_SESSIONS_PREFIX}${accountType}:${accountId}`
+  const timeout = getSessionInactiveTimeout()
+  const expireThreshold = Date.now() - timeout * 1000
   try {
-    return (await this.client.sismember(key, sessionHash)) === 1
+    const score = await this.client.zscore(key, sessionHash)
+    // score 存在且大于过期阈值才算有效
+    return score !== null && parseFloat(score) > expireThreshold
   } catch (error) {
     logger.error(`Failed to check session membership for ${accountId}:`, error)
     return false

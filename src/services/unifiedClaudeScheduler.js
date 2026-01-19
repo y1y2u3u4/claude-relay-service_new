@@ -404,6 +404,12 @@ class UnifiedClaudeScheduler {
             if (isAvailable) {
               // 🚀 智能会话续期：剩余时间少于14天时自动续期到15天（续期正确的 unified 映射键）
               await this._extendSessionMappingTTL(sessionHash)
+              // 🔄 刷新session活跃时间（基于ZSET的不活跃自动过期机制）
+              await redis.refreshAccountSession(
+                mappedAccount.accountType,
+                mappedAccount.accountId,
+                sessionHash
+              )
               logger.info(
                 `🎯 Using sticky session account: ${mappedAccount.accountId} (${mappedAccount.accountType}) for session ${sessionHash}`
               )
@@ -1694,6 +1700,12 @@ class UnifiedClaudeScheduler {
               if (isAvailable) {
                 // 🚀 智能会话续期：续期 unified 映射键
                 await this._extendSessionMappingTTL(sessionHash)
+                // 🔄 刷新session活跃时间（基于ZSET的不活跃自动过期机制）
+                await redis.refreshAccountSession(
+                  mappedAccount.accountType,
+                  mappedAccount.accountId,
+                  sessionHash
+                )
                 logger.info(
                   `🎯 Using sticky session account from group: ${mappedAccount.accountId} (${mappedAccount.accountType}) for session ${sessionHash}`
                 )
@@ -1912,6 +1924,12 @@ class UnifiedClaudeScheduler {
           if (isAvailable) {
             // 🚀 智能会话续期：续期 unified 映射键
             await this._extendSessionMappingTTL(sessionHash)
+            // 🔄 刷新session活跃时间（基于ZSET的不活跃自动过期机制）
+            await redis.refreshAccountSession(
+              mappedAccount.accountType,
+              mappedAccount.accountId,
+              sessionHash
+            )
             logger.info(
               `🎯 Using sticky CCR session account: ${mappedAccount.accountId} for session ${sessionHash}`
             )
