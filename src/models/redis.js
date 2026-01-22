@@ -3162,6 +3162,7 @@ redisClient.addAccountSession = async function (
 
 /**
  * 刷新 Session 的活跃时间（用于已绑定的session继续使用时）
+ * 同时清理该账户下过期的 session
  * @param {string} accountType - 账户类型
  * @param {string} accountId - 账户ID
  * @param {string} sessionHash - Session哈希
@@ -3170,10 +3171,26 @@ redisClient.addAccountSession = async function (
 redisClient.refreshAccountSession = async function (accountType, accountId, sessionHash) {
   const key = `${ACCOUNT_SESSIONS_PREFIX}${accountType}:${accountId}`
   const now = Date.now()
+  const timeout = getSessionInactiveTimeout()
+  const expireThreshold = now - timeout * 1000
+
   try {
-    // ZADD XX: 只更新已存在的成员，不添加新成员
-    const result = await this.client.zadd(key, 'XX', now, sessionHash)
-    // result = 0 表示更新了已存在的成员，result = 1 表示添加了新成员（但XX模式下不会添加）
+    // 使用 pipeline 原子执行：清理过期 + 刷新当前 session
+    const pipeline = this.client.pipeline()
+    // 1. 清理过期的 session
+    pipeline.zremrangebyscore(key, '-inf', expireThreshold)
+    // 2. 刷新当前 session 的活跃时间（XX: 只更新已存在的）
+    pipeline.zadd(key, 'XX', now, sessionHash)
+    // 3. 获取清理后的数量
+    pipeline.zcard(key)
+
+    const results = await pipeline.exec()
+    const removedCount = results[0][1] || 0
+    const currentCount = results[2][1] || 0
+
+    if (removedCount > 0) {
+      logger.info(`🧹 Cleaned ${removedCount} expired sessions from account ${accountId}, remaining: ${currentCount}`)
+    }
     logger.debug(`🔄 Refreshed session ${sessionHash.substring(0, 8)}... activity for account ${accountId}`)
     return true
   } catch (error) {
